@@ -1,3 +1,10 @@
+# javacard-maven-helloworld
+
+A minimal JavaCard Hello World applet built with Maven.
+
+This repository retains the Maven example's Git history from
+[docker-javacard](https://github.com/andreas-mausch/docker-javacard).
+
 # Requirements
 
 This project uses two separate Java compilers:
