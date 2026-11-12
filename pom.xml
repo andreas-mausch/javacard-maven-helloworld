@@ -15,6 +15,13 @@
     <relativePath />
   </parent>
 
+  <licenses>
+    <license>
+      <name>Apache-2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0</url>
+    </license>
+  </licenses>
+
   <properties>
     <applet.id>01:02:03:04:05:06</applet.id>
     <main.class>helloworld.HelloWorldApplet</main.class>

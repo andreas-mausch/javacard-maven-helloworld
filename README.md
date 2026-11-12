@@ -224,3 +224,8 @@ mvn versions:display-dependency-updates
 mvn versions:display-plugin-updates
 mvn versions:display-property-updates -DincludeParent
 ```
+
+# License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+The Oracle JavaCard SDK and third-party dependencies retain their own licenses.
