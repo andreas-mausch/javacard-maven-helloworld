@@ -1,0 +1,250 @@
+name: JavaCard Maven CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_simulator:
+        description: Run the Oracle simulator test (requires download URL secret)
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+    env:
+      JAVA_LTS_VERSION: '25'
+      MAVEN_VERSION: '3.9.16'
+      MAVEN_SHA512: 831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6
+      BIP39KEY_VERSION: '1.5.2'
+      BIP39KEY_SHA256: 5c9e68a2eeb9456b61aadaacd5402119ab2065fa3046cdd95c93492c52038a4a
+      JAVACARD_SDK_REVISION: 6a75ec0d6913db236d354f154df7dbc9573d976d
+      JAVACARD_SDK_SHA256: 067dc8b7d87130baf02fc57e1e8d5aa531d0a57830039ea82933e421e209f486
+      JAVACARD_SDK_KIT: jc305u4_kit
+      JAVACARD_API_VERSION: '3.0.5'
+      GRYPE_VERSION: '0.121.3'
+      GRYPE_SHA256: e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.MAVEN_PACKAGES_TOKEN || github.token }}
+    steps:
+      - name: Set isolated GPG directory
+        run: echo "GNUPGHOME=$RUNNER_TEMP/javacard-gnupg" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 8 for applet compilation
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          java-version: '8'
+          set-default: false
+
+      - name: Set up latest LTS JDK for Maven and tests
+        uses: actions/setup-java@v6.2.0
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_LTS_VERSION }}
+          check-latest: true
+          cache: maven
+          server-id: github
+          server-username: GITHUB_ACTOR
+          server-password: GITHUB_TOKEN
+
+      - name: Configure GitHub Packages repository
+        run: |
+          python3 - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          from pathlib import Path
+          path = Path.home() / '.m2/settings.xml'
+          tree = ET.parse(path)
+          root = tree.getroot()
+          ns = root.tag.removesuffix('settings')
+          def add(parent, tag, text=None):
+              node = ET.SubElement(parent, ns + tag)
+              node.text = text
+              return node
+          profiles = add(root, 'profiles')
+          profile = add(profiles, 'profile')
+          add(profile, 'id', 'github-packages')
+          repository = add(add(profile, 'repositories'), 'repository')
+          add(repository, 'id', 'github')
+          add(repository, 'url', 'https://maven.pkg.github.com/andreas-mausch/my-maven-setup')
+          add(add(root, 'activeProfiles'), 'activeProfile', 'github-packages')
+          tree.write(path, encoding='utf-8', xml_declaration=True)
+          PY
+
+      - name: Install Maven
+        run: |
+          cd "$RUNNER_TEMP"
+          url="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries/apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          curl -fsSL "$url" -o maven.tar.gz
+          echo "$MAVEN_SHA512  maven.tar.gz" | sha512sum --check
+          tar -xzf maven.tar.gz
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Install JavaCard SDK API
+        run: |
+          curl -fsSL "https://github.com/martinpaljak/oracle_javacard_sdks/archive/${JAVACARD_SDK_REVISION}.tar.gz" -o "$RUNNER_TEMP/sdk.tar.gz"
+          echo "$JAVACARD_SDK_SHA256  $RUNNER_TEMP/sdk.tar.gz" | sha256sum --check
+          mkdir -p "$RUNNER_TEMP/javacard-sdks"
+          tar -xzf "$RUNNER_TEMP/sdk.tar.gz" -C "$RUNNER_TEMP/javacard-sdks" --strip-components=1
+          sdk_path="$RUNNER_TEMP/javacard-sdks/$JAVACARD_SDK_KIT"
+          echo "JAVACARD_SDK_PATH=$sdk_path" >> "$GITHUB_ENV"
+          mvn --batch-mode --no-transfer-progress install:install-file \
+            -Dfile="$sdk_path/lib/api_classic.jar" \
+            -DgroupId=com.oracle.javacard -DartifactId=api-classic \
+            -Dversion="$JAVACARD_API_VERSION" -Dpackaging=jar
+
+      - name: Install Grype
+        run: |
+          curl -fsSL "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz" -o "$RUNNER_TEMP/grype.tar.gz"
+          echo "$GRYPE_SHA256  $RUNNER_TEMP/grype.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/grype.tar.gz" -C "$RUNNER_TEMP" grype
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Determine Grype database cache key
+        id: grype-cache-key
+        run: echo "week=$(date --utc +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Grype database
+        id: grype-db-cache
+        uses: actions/cache@v6.1.0
+        with:
+          path: ~/.cache/grype/db
+          key: grype-db-v${{ env.GRYPE_VERSION }}-${{ runner.os }}-${{ steps.grype-cache-key.outputs.week }}
+          restore-keys: |
+            grype-db-v${{ env.GRYPE_VERSION }}-${{ runner.os }}-
+
+      - name: Configure Grype database updates
+        env:
+          GRYPE_DB_CACHE_HIT: ${{ steps.grype-db-cache.outputs.cache-hit }}
+        run: |
+          if [ "$GRYPE_DB_CACHE_HIT" = true ]; then
+            echo 'GRYPE_DB_AUTO_UPDATE=false' >> "$GITHUB_ENV"
+            grype db status
+          else
+            echo 'GRYPE_DB_AUTO_UPDATE=true' >> "$GITHUB_ENV"
+            grype db update
+          fi
+
+      - name: Prepare isolated signing key
+        env:
+          OPENPGP_KEY_BIP39_MNEMONIC: ${{ secrets.OPENPGP_KEY_BIP39_MNEMONIC }}
+        run: |
+          mkdir -p "$GNUPGHOME"
+          chmod 700 "$GNUPGHOME"
+          if [ -n "$OPENPGP_KEY_BIP39_MNEMONIC" ]; then
+            curl -fsSL "https://github.com/jpdarago/bip39key/releases/download/v${BIP39KEY_VERSION}/bip39key-x86_64-unknown-linux-musl.tar.gz" -o "$RUNNER_TEMP/bip39key.tar.gz"
+            echo "$BIP39KEY_SHA256  $RUNNER_TEMP/bip39key.tar.gz" | sha256sum --check
+            tar -xzf "$RUNNER_TEMP/bip39key.tar.gz" -C "$RUNNER_TEMP"
+            printf '%s\n' "$OPENPGP_KEY_BIP39_MNEMONIC" | "$RUNNER_TEMP/bip39key-x86_64-unknown-linux-musl" --user-id='JavaCard CI' --armor > "$GNUPGHOME/key.asc"
+            gpg --homedir "$GNUPGHOME" --batch --import "$GNUPGHOME/key.asc"
+          else
+            gpg --homedir "$GNUPGHOME" --batch --pinentry-mode loopback \
+              --passphrase '' --quick-generate-key \
+              'JavaCard CI test key <ci@example.invalid>' rsa2048 sign 0
+          fi
+          fingerprint=$(gpg --homedir "$GNUPGHOME" --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
+          echo "SIGNING_KEY=$fingerprint" >> "$GITHUB_ENV"
+
+      - name: Build with all optional checks and reports
+        run: |
+          mvn --batch-mode --no-transfer-progress \
+            -Plinting,coverage,size-optimization,sbom,license-check,vulnerability-report,sign \
+            clean verify \
+            -Djava.compiler.main.path="$JAVA_HOME_8_X64/bin/javac" \
+            -Djavacard.sdk.path="$JAVACARD_SDK_PATH" \
+            -Dgpg.homedir="$GNUPGHOME" -Dgpg.key="$SIGNING_KEY" \
+            -Dgpg.useagent=false -Dgpg.passphrase=
+
+      - name: Verify signatures and export public key
+        run: |
+          for signature in target/*.asc; do
+            gpg --homedir "$GNUPGHOME" --batch --verify "$signature" "${signature%.asc}"
+          done
+          gpg --homedir "$GNUPGHOME" --armor --export "$SIGNING_KEY" > target/javacard-ci-public-key.asc
+
+      - name: Fail on high or critical production vulnerabilities
+        run: |
+          shopt -s nullglob
+          sboms=(target/*.sbom.cyclonedx.json)
+          if [ "${#sboms[@]}" -ne 1 ]; then
+            echo "Expected exactly one CycloneDX SBOM, found ${#sboms[@]}" >&2
+            exit 1
+          fi
+          grype "sbom:${sboms[0]}" --fail-on high
+
+      - name: Upload build artifacts and reports
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: javacard-build
+          path: |
+            target/*.cap
+            target/*.jar
+            target/*.pom
+            target/*.asc
+            target/*.sbom.*
+            target/reports/
+            target/failsafe-reports/
+          if-no-files-found: warn
+
+      - name: Stop isolated GPG agent
+        if: always()
+        run: gpgconf --homedir "$GNUPGHOME" --kill gpg-agent
+
+  oracle-simulator:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.run_simulator
+    runs-on: ubuntu-26.04
+    env:
+      GLOBALPLATFORMPRO_VERSION: '24.10.15'
+      DOCKER_JAVACARD_REVISION: beed65c525d9c0bc24ad4a9e3d4e873b0d2a2d86
+      SIMULATOR_ARCHIVE: java_card_devkit_simulator-linux-bin-v25.0-b_474-23-APR-2025.tar.gz
+      SIMULATOR_SHA256: cc75856fd90ea8e2c30f3239cd70e6e259694a6679e81d0141940d8e5d083efd
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - name: Check out Docker JavaCard environment
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: andreas-mausch/docker-javacard
+          ref: ${{ env.DOCKER_JAVACARD_REVISION }}
+          path: docker-environment
+          submodules: recursive
+
+      - name: Download Oracle simulator
+        env:
+          SIMULATOR_URL: ${{ secrets.ORACLE_JAVACARD_SIMULATOR_URL }}
+        run: |
+          test -n "$SIMULATOR_URL"
+          file="docker-environment/external/oracle_javacard_simulator/$SIMULATOR_ARCHIVE"
+          curl -fsSL "$SIMULATOR_URL" -o "$file"
+          echo "$SIMULATOR_SHA256  $file" | sha256sum --check
+
+      - name: Build simulator image
+        run: docker build --quiet --build-arg JAVACARD_SIMULATOR="$SIMULATOR_ARCHIVE" --tag docker-javacard docker-environment
+
+      - uses: actions/download-artifact@v8.0.2
+        with:
+          name: javacard-build
+          path: artifacts
+
+      - name: Install and test CAP in Oracle simulator
+        run: |
+          docker run --rm \
+            --volume "$PWD/artifacts/010203040506.cap:/applet/helloworld.cap:ro" \
+            --volume "$PWD/hello.gpshell:/applet/hello.gpshell:ro" \
+            --env GLOBALPLATFORMPRO_VERSION="$GLOBALPLATFORMPRO_VERSION" \
+            --env START_JAVACARD_SIMULATOR=y docker-javacard \
+            bash -ec 'gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }; unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK; gp --install ./helloworld.cap; gpshell ./hello.gpshell'

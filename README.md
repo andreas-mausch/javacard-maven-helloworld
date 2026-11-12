@@ -225,6 +225,31 @@ mvn versions:display-plugin-updates
 mvn versions:display-property-updates -DincludeParent
 ```
 
+# Continuous integration
+
+`.github/workflows/ci.yml` builds on pushes and pull requests to `main`.
+It runs linting, tests, coverage, size optimization, SBOM generation, license
+checks, vulnerability reports, and signing. It verifies signatures and uploads
+the CAP, JAR, SBOMs, public signing key, and reports. High or critical findings
+in the production CycloneDX SBOM fail CI.
+
+Configure GitHub Packages access before the first run: grant this repository
+access to the packages in `my-maven-setup`, or set the `MAVEN_PACKAGES_TOKEN`
+secret to a token with `read:packages`. Without that secret, CI uses its
+`GITHUB_TOKEN`. Fork pull requests cannot access repository secrets and need
+package access that works with their available token.
+
+Signing uses an isolated temporary GPG directory. Set
+`OPENPGP_KEY_BIP39_MNEMONIC` to use the existing deterministic CI signing key;
+otherwise CI generates a disposable test key. Test-key signatures are not
+release signatures.
+
+The additional Oracle simulator job is opt-in: start the workflow manually with
+`run_simulator` enabled and set `ORACLE_JAVACARD_SIMULATOR_URL` to the download
+URL for the v25.0 simulator archive used by `docker-javacard`. The job builds
+the Docker environment from a pinned commit, installs the CAP, and runs
+`hello.gpshell`. Its download is checksum-verified.
+
 # License
 
 This project is licensed under the [Apache License 2.0](LICENSE).
