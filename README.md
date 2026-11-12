@@ -21,7 +21,7 @@ Only the applet compilation step requires a separate JDK 8 compiler.
 # Configuration
 
 `pom.xml` contains project-specific settings, plugins and dependencies. It inherits
-from `de.neonew:javacard-parent:1.1.0`, which extends the Java parent from
+from `de.neonew:javacard-parent:1.2.0`, which extends the Java parent from
 [my-maven-setup](https://github.com/andreas-mausch/my-maven-setup).
 
 The parents and shared build configuration are published in GitHub Packages.
@@ -38,6 +38,10 @@ You **must** define these properties in your `pom.xml`:
 qualifier (e.g. `1.0-SNAPSHOT` → `1.0`). You can still override it explicitly.
 
 # Build
+
+This example uses the **JavaCard 3.0.5 SDK (`jc305u4_kit`)**. SDKs are
+available from [oracle_javacard_sdks](https://github.com/martinpaljak/oracle_javacard_sdks).
+The SDK is not bundled with this project and has its own license.
 
 Before the first build, install the JavaCard SDK's `api_classic.jar` into your local
 Maven repository. This is a one-time step:
@@ -73,60 +77,104 @@ The build produces `target/010203040506.cap` and
 `target/javacard-applet-1.0-SNAPSHOT.jar`. Add `-Psize-optimization` to enable
 ProGuard, or `-Pcoverage` for coverage reports in `target/reports/coverage`.
 
+The commands below assume both local paths have been configured in
+`.mvn/maven.config`. Otherwise, append the two `-D` path arguments to each build
+command. This local configuration file is ignored by Git.
+
+# Testing and reports
+
+`mvn clean verify` runs all tests. Integration tests live under
+`src/test-integration/java` in a package containing `.integration.`.
+Surefire excludes these tests; Failsafe runs them during `verify`.
+
+This example currently has three integration tests and no separate unit tests.
+Results are written to `target/failsafe-reports/`, with an HTML report at
+`target/reports/tests-integration.html`. A warning about missing unit-test report
+input is expected because there are no unit tests.
+
+# Linting and formatting
+
+Check formatting without changing files:
+
+```bash
+mvn -Plinting clean verify
+```
+
+Apply formatting:
+
+```bash
+mvn -Plinting spotless:apply
+```
+
+Spotless formats Java sources and `pom.xml` using the parent rules, including
+two-space indentation. Wildcard imports are forbidden and must be replaced
+manually if reported.
+
+# Coverage and size optimization
+
+```bash
+mvn -Pcoverage clean verify
+mvn -Psize-optimization clean verify
+```
+
+The HTML coverage report is `target/reports/coverage.html`; XML and CSV data
+are written to `target/reports/coverage/`. Size optimization
+uses ProGuard before JCDK builds the `.cap`; it is disabled by default.
+Profiles can be combined, for example `-Plinting,coverage,size-optimization`.
+
 # Software Bill of Materials (SBOM)
 
-The project includes two SBOM generators (opt-in via `pom.xml`):
+The parent provides two SBOM generators through the `sbom` profile:
 
 - **CycloneDX** (`org.cyclonedx:cyclonedx-maven-plugin`) — security-focused, excludes test dependencies.
-  Output: `target/bom.json`
+  Output: `target/javacard-applet-1.0-SNAPSHOT.sbom.cyclonedx.json`
 - **SPDX** (`org.spdx:spdx-maven-plugin`) — license/compliance-focused, includes all scopes.
-  Output: `target/site/helloworld_javacard-applet-1.0-SNAPSHOT.spdx.json`
+  Output: `target/javacard-applet-1.0-SNAPSHOT.sbom.spdx.json`
 
 Both run during `mvn package` and produce JSON. Activate them with the `sbom` profile:
 
 ```bash
-mvn clean package -Psbom
+mvn -Psbom clean package
 ```
 
-# Shaded (fat) .jar
+# Vulnerability scanning
 
-The project can produce a shaded (fat) JAR with the `maven-shade-plugin`.
-Activate it by adding the `shade` and `git-commit-id` plugins:
+Install [Grype](https://github.com/anchore/grype) and ensure `grype` is on your
+`PATH`. Generate an SBOM and scan dependencies:
 
-```xml
-<plugin>
-  <groupId>io.github.git-commit-id</groupId>
-  <artifactId>git-commit-id-maven-plugin</artifactId>
-</plugin>
-<plugin>
-  <groupId>org.apache.maven.plugins</groupId>
-  <artifactId>maven-shade-plugin</artifactId>
-</plugin>
+```bash
+mvn -Psbom,vulnerability-report clean verify
 ```
 
-Set `<mainClass>` via a `ManifestResourceTransformer` in your own configuration
-if you need an executable JAR.
+Open `target/reports/vulnerabilities-dependencies.html` for the results.
+The scan uses the CycloneDX SBOM, which excludes test dependencies such as
+jCardSim and JUnit. The SPDX SBOM includes test dependencies but is not used
+by this scan.
+The scan requires access to Grype's vulnerability database. This profile
+generates a report; a successful build does not imply there are no findings.
 
 # License check
 
-Enforce that all dependencies use only FOSS licenses with the `license-check`
-profile:
+Check dependency licenses against the parent's allowlist:
 
 ```bash
-mvn clean verify -Plicense-check
+mvn -Plicense-check clean verify
 ```
 
-The build fails if any dependency has a license not in the FOSS allowlist or is
+The build fails if any dependency has a license not in the allowlist or is
 missing license metadata.
 
 License aliases, the allowlist and the Oracle JavaCard SDK metadata override are
 provided by the parents and shared build configuration in `my-maven-setup`.
+The Oracle SDK is explicitly allowed; this does not make it FOSS.
+Reports are written to `target/reports/THIRD-PARTY.txt` and
+`target/reports/dependency-licenses.html`.
 
 # Run single test
 
 ```bash
-mvn test [-Dtest=TestClass#testMethod]
-mvn failsafe:integration-test [-Dit.test=TestClass#testMethod]
+mvn test-compile failsafe:integration-test failsafe:verify \
+  -Dit.test=HelloWorldAppletTest#testPing
 ```
 
 # Signing
@@ -144,7 +192,7 @@ Find your key fingerprint with `gpg --list-secret-keys`.
 Each release artifact (`.jar`, `.cap`, `.pom`) has a matching `.asc` signature file. To verify it's from the correct author:
 
 ```bash
-gpg --verify javacard-applet-1.0.asc javacard-applet-1.0.cap
+gpg --verify target/010203040506.cap.asc target/010203040506.cap
 ```
 
 You need the author's public key imported. It can be downloaded from a key server:
@@ -154,6 +202,18 @@ gpg --keyserver keys.openpgp.org --recv-key 1234567890ABCDEF1234567890ABCDEF1234
 ```
 
 Replace the key ID with the one used for signing.
+
+# More parent features and troubleshooting
+
+See [JavaCard setup](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.2.0/README-javacard.md)
+and [shared features](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.2.0/Features.md)
+for compiler warnings, optional vulnerability scanning with Grype, pre-commit
+hooks, and additional build features.
+
+If parent resolution fails, check the GitHub Packages repository and token in
+your Maven settings. If `api-classic` cannot be resolved, install the SDK JAR as
+shown above. If compilation or CAP conversion fails, check both local paths and
+ensure the applet compiler is from JDK 8.
 
 # Maintenance
 
