@@ -10,24 +10,29 @@ This repository retains the Maven example's Git history from
 This project uses two separate Java compilers:
 
 - **Main sources (applet code)** — compiled against Java 1.1 with a **JDK 8** `javac`, because recent JDKs (17+) reject the old `-target 1.1` option that JavaCards require. You must specify the path to your JDK 8 `javac` via `-Djava.compiler.main.path`.
-- **Test sources** — compiled normally using whatever JDK is on your `$PATH` / `$JAVA_HOME` (Java 17+ recommended).
+- **Test sources** — compiled using your JDK from `$JAVA_HOME` / `$PATH`.
 
-You can use any modern Java version for running tests and general development. Only the applet compilation step requires JDK 8.
+Use **Maven 3.9.16 or newer** with your installed **JDK 25 or newer**;
+you do not need to install JDK 25 specifically if you already use Java 27.
+Only the applet compilation step requires a separate JDK 8 compiler.
 
 > **Note:** If you increase the target version beyond 1.1, the resulting `.cap` file may not run on all JavaCards.
 
 # Configuration
 
-I have split the Maven configuration into three files:
+`pom.xml` contains project-specific settings, plugins and dependencies. It inherits
+from `de.neonew:javacard-parent:1.1.0`, which extends the Java parent from
+[my-maven-setup](https://github.com/andreas-mausch/my-maven-setup).
 
-- `pom.xml` for project-specific settings, plugins and dependencies.
-- `parent-javacard.xml` for configuration related to all JavaCard projects.
-- `parent-java.xml` for my general favorite Maven settings for Java projects.
-  It also specifies the plugin versions and default configuration.
+The parents and shared build configuration are published in GitHub Packages.
+Before building, configure the repository and credentials in `~/.m2/settings.xml`
+as described in [Configure GitHub Packages](https://github.com/andreas-mausch/my-maven-setup#configure-github-packages).
+A GitHub token with `read:packages` permission is required. No credentials belong
+in this repository.
 
 You **must** define these properties in your `pom.xml`:
 - `<applet.id>` — JavaCard AID (e.g. `01:02:03:04:05:06`)
-- `<applet.main.class>` — fully qualified applet class (e.g. `helloworld.HelloWorldApplet`)
+- `<main.class>` — fully qualified applet class (e.g. `helloworld.HelloWorldApplet`)
 
 `<applet.version>` is automatically derived from `<version>` by stripping any
 qualifier (e.g. `1.0-SNAPSHOT` → `1.0`). You can still override it explicitly.
@@ -39,7 +44,7 @@ Maven repository. This is a one-time step:
 
 ```bash
 mvn install:install-file \
-  -Dfile=../../../external/oracle_javacard_sdks/jc305u4_kit/lib/api_classic.jar \
+  -Dfile=/path/to/jc305u4_kit/lib/api_classic.jar \
   -DgroupId=com.oracle.javacard -DartifactId=api-classic \
   -Dversion=3.0.5 -Dpackaging=jar
 ```
@@ -47,16 +52,26 @@ mvn install:install-file \
 Then build the project:
 
 ```bash
-mvn clean verify -Djava.compiler.main.path=/path/to/jdk8/bin/javac
+mvn clean verify \
+  -Djava.compiler.main.path=/path/to/jdk8/bin/javac \
+  -Djavacard.sdk.path=/path/to/jc305u4_kit
 ```
 
-The `-Djava.compiler.main.path` argument is **required** — the build will fail without it. This tells the compiler which JDK 8 `javac` to use for applet code.
+Both path arguments are **required**. They select the JDK 8 compiler and JavaCard SDK.
 
 To avoid passing it every time, persist it in `.mvn/maven.config`:
 
 ```bash
-echo '-Djava.compiler.main.path=/path/to/jdk8/bin/javac' > .mvn/maven.config
+mkdir -p .mvn
+cat > .mvn/maven.config <<'EOF'
+-Djava.compiler.main.path=/path/to/jdk8/bin/javac
+-Djavacard.sdk.path=/path/to/jc305u4_kit
+EOF
 ```
+
+The build produces `target/010203040506.cap` and
+`target/javacard-applet-1.0-SNAPSHOT.jar`. Add `-Psize-optimization` to enable
+ProGuard, or `-Pcoverage` for coverage reports in `target/reports/coverage`.
 
 # Software Bill of Materials (SBOM)
 
@@ -104,11 +119,8 @@ mvn clean verify -Plicense-check
 The build fails if any dependency has a license not in the FOSS allowlist or is
 missing license metadata.
 
-License aliases and the allowlist are defined in `parent-java.xml` under
-`<licenseMerges>` and `<includedLicenses>`. Project-specific overrides (e.g.
-for the Oracle JavaCard SDK) can be added in `parent-javacard.xml` via
-`combine.children="append"` and a `license-override.properties` file in the
-project root.
+License aliases, the allowlist and the Oracle JavaCard SDK metadata override are
+provided by the parents and shared build configuration in `my-maven-setup`.
 
 # Run single test
 
