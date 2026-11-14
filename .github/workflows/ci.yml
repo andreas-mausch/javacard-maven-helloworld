@@ -14,7 +14,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   build:
@@ -31,8 +30,6 @@ jobs:
       JAVACARD_API_VERSION: '3.0.5'
       GRYPE_VERSION: '0.121.3'
       GRYPE_SHA256: e9da18cc1429e786722e32161288103600efffd8e483c90761f90485bd1bec85
-      GITHUB_ACTOR: ${{ github.actor }}
-      GITHUB_TOKEN: ${{ secrets.MAVEN_PACKAGES_TOKEN || github.token }}
     steps:
       - name: Set isolated GPG directory
         run: echo "GNUPGHOME=$RUNNER_TEMP/javacard-gnupg" >> "$GITHUB_ENV"
@@ -55,33 +52,6 @@ jobs:
           java-version: ${{ env.JAVA_LTS_VERSION }}
           check-latest: true
           cache: maven
-          server-id: github
-          server-username: GITHUB_ACTOR
-          server-password: GITHUB_TOKEN
-
-      - name: Configure GitHub Packages repository
-        run: |
-          python3 - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
-          from pathlib import Path
-          path = Path.home() / '.m2/settings.xml'
-          tree = ET.parse(path)
-          root = tree.getroot()
-          ns = root.tag.removesuffix('settings')
-          def add(parent, tag, text=None):
-              node = ET.SubElement(parent, ns + tag)
-              node.text = text
-              return node
-          profiles = add(root, 'profiles')
-          profile = add(profiles, 'profile')
-          add(profile, 'id', 'github-packages')
-          repository = add(add(profile, 'repositories'), 'repository')
-          add(repository, 'id', 'github')
-          add(repository, 'url', 'https://maven.pkg.github.com/andreas-mausch/my-maven-setup')
-          add(add(root, 'activeProfiles'), 'activeProfile', 'github-packages')
-          tree.write(path, encoding='utf-8', xml_declaration=True)
-          PY
 
       - name: Install Maven
         run: |

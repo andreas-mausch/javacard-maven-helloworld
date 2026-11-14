@@ -21,14 +21,8 @@ Only the applet compilation step requires a separate JDK 8 compiler.
 # Configuration
 
 `pom.xml` contains project-specific settings, plugins and dependencies. It inherits
-from `de.neonew:javacard-parent:1.2.0`, which extends the Java parent from
+from `de.neonew.build:javacard-parent:1.3.0`, which extends the Java parent from
 [my-maven-setup](https://github.com/andreas-mausch/my-maven-setup).
-
-The parents and shared build configuration are published in GitHub Packages.
-Before building, configure the repository and credentials in `~/.m2/settings.xml`
-as described in [Configure GitHub Packages](https://github.com/andreas-mausch/my-maven-setup#configure-github-packages).
-A GitHub token with `read:packages` permission is required. No credentials belong
-in this repository.
 
 You **must** define these properties in your `pom.xml`:
 - `<applet.id>` — JavaCard AID (e.g. `01:02:03:04:05:06`)
@@ -205,13 +199,13 @@ Replace the key ID with the one used for signing.
 
 # More parent features and troubleshooting
 
-See [JavaCard setup](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.2.0/README-javacard.md)
-and [shared features](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.2.0/Features.md)
+See [JavaCard setup](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.3.0/README-javacard.md)
+and [shared features](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.3.0/Features.md)
 for compiler warnings, optional vulnerability scanning with Grype, pre-commit
 hooks, and additional build features.
 
-If parent resolution fails, check the GitHub Packages repository and token in
-your Maven settings. If `api-classic` cannot be resolved, install the SDK JAR as
+If parent resolution fails, check the parent coordinates and your Maven settings.
+If `api-classic` cannot be resolved, install the SDK JAR as
 shown above. If compilation or CAP conversion fails, check both local paths and
 ensure the applet compiler is from JDK 8.
 
@@ -232,12 +226,6 @@ It runs linting, tests, coverage, size optimization, SBOM generation, license
 checks, vulnerability reports, and signing. It verifies signatures and uploads
 the CAP, JAR, SBOMs, public signing key, and reports. High or critical findings
 in the production CycloneDX SBOM fail CI.
-
-Configure GitHub Packages access before the first run: grant this repository
-access to the packages in `my-maven-setup`, or set the `MAVEN_PACKAGES_TOKEN`
-secret to a token with `read:packages`. Without that secret, CI uses its
-`GITHUB_TOKEN`. Fork pull requests cannot access repository secrets and need
-package access that works with their available token.
 
 Signing uses an isolated temporary GPG directory. Set
 `OPENPGP_KEY_BIP39_MNEMONIC` to use the existing deterministic CI signing key;
