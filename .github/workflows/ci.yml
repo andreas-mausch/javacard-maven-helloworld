@@ -178,8 +178,8 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.run_simulator
     runs-on: ubuntu-26.04
     env:
-      GLOBALPLATFORMPRO_VERSION: '24.10.15'
-      DOCKER_JAVACARD_REVISION: beed65c525d9c0bc24ad4a9e3d4e873b0d2a2d86
+      GLOBALPLATFORMPRO_VERSION: '25.10.20'
+      DOCKER_JAVACARD_REVISION: 690f4dbfdde6effd74aaa11058b4d2762c0868a6
       SIMULATOR_ARCHIVE: java_card_devkit_simulator-linux-bin-v26.0-b_788-05-MAY-2026.tar.gz
       SIMULATOR_SHA256: b8b999c3e1cfac5d56f7ef16654ce28c99cf472d96761d419a03ddf11f5811c0
     steps:
