@@ -1,0 +1,10 @@
+#!/bin/bash
+# Pre-commit hook: check source and POM formatting with Spotless
+# Activate with: git config core.hooksPath githooks
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+mvn --batch-mode --no-transfer-progress \
+  --file "$repo_root/pom.xml" \
+  --activate-profiles linting \
+  spotless:check

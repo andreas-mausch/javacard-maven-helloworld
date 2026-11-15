@@ -127,6 +127,13 @@ Spotless formats Java sources and `pom.xml` using the parent rules, including
 two-space indentation. Wildcard imports are forbidden and must be replaced
 manually if reported.
 
+Run these checks automatically before every commit by enabling the included
+pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath githooks
+```
+
 # Coverage and size optimization
 
 ```bash
