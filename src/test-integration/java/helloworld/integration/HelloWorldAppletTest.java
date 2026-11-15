@@ -17,15 +17,19 @@ import org.junit.jupiter.api.Test;
 
 public class HelloWorldAppletTest {
 
-  private static final String PACKAGE_AID_HEX = "01020304050607";
+  // Applet instance AID, injected by javacard-parent from <applet.id> in pom.xml.
+  // A default install uses it as the selectable instance AID; the JavaCard package
+  // AID is derived from its first 5 bytes (0102030405).
+  private static final String APPLET_AID_HEX = System.getProperty("javacard.applet.id.nocolons");
   private static CardSimulator simulator;
 
   @BeforeAll
   static void beforeAll() throws IOException {
     simulator = new CardSimulator();
 
-    // Install applet
-    byte[] aid_bytes = Hex.decode(PACKAGE_AID_HEX + "01");
+    // Install applet; install data carries the AID as [length][bytes], matching the
+    // register(bArray, bOffset + 1, bArray[bOffset]) idiom in HelloWorldApplet.
+    byte[] aid_bytes = Hex.decode(APPLET_AID_HEX);
 
     AID aid = AIDUtil.create(aid_bytes);
     ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -40,7 +44,7 @@ public class HelloWorldAppletTest {
   void beforeEach() throws IOException {
     simulator.reset();
 
-    byte[] aid_bytes = Hex.decode(PACKAGE_AID_HEX + "01");
+    byte[] aid_bytes = Hex.decode(APPLET_AID_HEX);
     AID aid = AIDUtil.create(aid_bytes);
     simulator.selectApplet(aid);
   }
