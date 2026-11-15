@@ -212,7 +212,15 @@ jobs:
 
       - name: Install and test CAP in Oracle simulator
         run: |
+          # The GitHub runner's AppArmor setup denies the 32-bit jcsl
+          # simulator's socket() call ("failed to create socket").
+          # Lift AppArmor/seccomp for this ephemeral simulator container on
+          # the runner; locally (without those restrictions) it works
+          # without these flags. See
+          # github.com/andreas-mausch/docker-javacard/commit/56ba8b6.
           docker run --rm \
+            --security-opt apparmor=unconfined \
+            --security-opt seccomp=unconfined \
             --volume "$PWD/artifacts/010203040506.cap:/applet/helloworld.cap:ro" \
             --volume "$PWD/hello.gpshell:/applet/hello.gpshell:ro" \
             --env GLOBALPLATFORMPRO_VERSION="$GLOBALPLATFORMPRO_VERSION" \
