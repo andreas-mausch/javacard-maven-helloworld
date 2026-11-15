@@ -234,7 +234,7 @@ release signatures.
 
 The additional Oracle simulator job is opt-in: start the workflow manually with
 `run_simulator` enabled and set `ORACLE_JAVACARD_SIMULATOR_URL` to the download
-URL for the v25.0 simulator archive used by `docker-javacard`. The job builds
+URL for the v26.0 simulator archive used by `docker-javacard`. The job builds
 the Docker environment from a pinned commit, installs the CAP, and runs
 `hello.gpshell`. Its download is checksum-verified.
 
