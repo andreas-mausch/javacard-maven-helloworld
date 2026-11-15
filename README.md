@@ -12,8 +12,8 @@ This project uses two separate Java compilers:
 - **Main sources (applet code)** — compiled against Java 1.1 with a **JDK 8** `javac`, because recent JDKs (17+) reject the old `-target 1.1` option that JavaCards require. You must specify the path to your JDK 8 `javac` via `-Djava.compiler.main.path`.
 - **Test sources** — compiled using your JDK from `$JAVA_HOME` / `$PATH`.
 
-Use **Maven 3.9.16 or newer** with your installed **JDK 25 or newer**;
-you do not need to install JDK 25 specifically if you already use Java 27.
+Use **Maven 3.9 or newer** with your installed **JDK 25 or newer**;
+3.9.12 or newer avoids some deprecation warnings on JDK 25.
 Only the applet compilation step requires a separate JDK 8 compiler.
 
 > **Note:** If you increase the target version beyond 1.1, the resulting `.cap` file may not run on all JavaCards.
@@ -30,6 +30,29 @@ You **must** define these properties in your `pom.xml`:
 
 `<applet.version>` is automatically derived from `<version>` by stripping any
 qualifier (e.g. `1.0-SNAPSHOT` → `1.0`). You can still override it explicitly.
+
+# AIDs
+
+JavaCard distinguishes three AIDs. In this project they are:
+
+| AID | Value | Where it comes from |
+|---|---|---|
+| Package AID | `0102030405` | Derived from the first 5 bytes of `<applet.id>`; exposed as the `${package.id}` property |
+| Applet AID | `010203040506` | Your `<applet.id>`; stored in the CAP's applet component |
+| Instance AID | `010203040506` | Assigned at install time; a default `gp --install` (and jCardSim's `installApplet`) uses the applet AID |
+
+`SELECT` always targets the *instance* AID — `010203040506` here:
+
+```text
+00 A4 04 00 06 010203040506 → 9000
+```
+
+Integration tests receive all values as system properties injected by the parent:
+`javacard.applet.id`, `javacard.applet.id.nocolons`, `javacard.package.id` and
+`javacard.package.id.nocolons` — see `HelloWorldAppletTest`.
+
+See [AIDs](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.4.0/README-javacard.md#aids)
+for the background on all three.
 
 # Build
 
