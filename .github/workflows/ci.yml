@@ -223,8 +223,10 @@ jobs:
           # without these flags. See
           # github.com/andreas-mausch/docker-javacard/commit/56ba8b6.
           # The CAP holds two applets: gp --install needs --applet for the
-          # first instance; the second one is created with gp --create
-          # (a second load of the same package fails with 0x6985).
+          # first instance; the secure-channel instances are created with
+          # gp --create (a second load of the same package fails with
+          # 0x6985). The --params byte picks the cipher suite and is
+          # mandatory: 01 = AES-256-GCM, 02 = AES-256-CBC+HMAC-SHA-256.
           docker run --rm \
             --security-opt apparmor=unconfined \
             --security-opt seccomp=unconfined \
@@ -232,6 +234,6 @@ jobs:
             --volume "$PWD/simulator:/simulator:ro" \
             --env GLOBALPLATFORMPRO_VERSION="$GLOBALPLATFORMPRO_VERSION" \
             --env START_JAVACARD_SIMULATOR=y docker-javacard \
-            bash -ec 'gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }; unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK; gp --install ./helloworld.cap --applet 010203040506; gp --create 010203040507 --package 0102030405 --applet 010203040507; gpshell ./hello.gpshell; javac -d /tmp/smoke /simulator/OracleSimulatorSmokeTest.java && java -cp /tmp/smoke OracleSimulatorSmokeTest' \
+            bash -ec 'gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }; unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK; gp --install ./helloworld.cap --applet 010203040506; gp --create 010203040507 --package 0102030405 --applet 010203040507 --params 01; gp --create 010203040508 --package 0102030405 --applet 010203040507 --params 02; gpshell ./hello.gpshell; javac -d /tmp/smoke /simulator/OracleSimulatorSmokeTest.java && java -cp /tmp/smoke OracleSimulatorSmokeTest' \
             | tee "$RUNNER_TEMP/oracle-simulator.log"
           grep -Fxq 'Unwrapped response <-- 48656C6C6F9000' "$RUNNER_TEMP/oracle-simulator.log"
