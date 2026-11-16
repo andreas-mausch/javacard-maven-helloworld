@@ -20,7 +20,17 @@ import javacardx.crypto.AEADCipher;
 import javacardx.crypto.Cipher;
 
 /**
- * Applet with an ECDH + HKDF-SHA256 + AES-256-GCM secure channel.
+ * Applet with an ECDH + HKDF-SHA256 authenticated secure channel.
+ *
+ * <h2>Cipher suites (fixed at install time, no negotiation, no fallback)</h2>
+ *
+ * The GP INSTALL private data must be exactly one byte choosing the suite:
+ * {@code 01} = AES-256-GCM ({@link javacardx.crypto.AEADCipher}), {@code 02} =
+ * AES-256-CBC (ISO9797-M2 padding) + HMAC-SHA-256 Encrypt-then-MAC. Anything
+ * else fails the install ({@code 0x9E01} missing parameter, {@code 0x9E02}
+ * unknown value) and a card that cannot run the chosen suite fails with
+ * {@code 0x9F00 | bitmask} (see probe(), README has the table). Example:
+ * {@code gp --create ...0507 --applet ...0507 --params 02}.
  *
  * <h2>Protocol (version 1)</h2>
  *
@@ -29,29 +39,40 @@ import javacardx.crypto.Cipher;
  *
  * INIT (INS 0x10, no data) -&gt;
  *   out: Q_card (65B uncompressed EC point, secp256r1) || N_card (16B nonce)
+ *        || suite (1B echo so the host derives matching keys)
  *   Regenerates the ephemeral ECDH key pair and wipes any active session.
  *
  * EXCHANGE (INS 0x12) -&gt;
- *   in:  Q_peer (65B) || N_peer (16B) || iv_c (12B) || conf_token (16B ct)
- *        || conf_tag (16B)
- *   out: iv_s (12B) || conf_token_s (16B ct) || conf_tag_s (16B)
+ *   in:  Q_peer (65B) || N_peer (16B) || iv_c (12/16B) || conf_token ct
+ *        (16/32B) || tag (16B)
+ *   out: iv_s || conf_token_s ct || tag (16B)
+ *   (12/16B and 16/32B for suites 01/02; the tag is always 16B)
  *
  *   Z       = ECDH(d_card, Q_peer)                       (32B, plain X coord)
  *   salt    = N_card || N_peer
  *   PRK     = HKDF-Extract(salt, Z)                      (HMAC-SHA-256)
- *   K_conf  = HKDF-Expand(PRK, "SCv1-conf" || 0x01)[0..16)
- *   K_msg   = HKDF-Expand(PRK, "SCv1-msg"  || 0x01)[0..32)
- *   conf_token = AES-GCM(K_conf, iv_c, pt = 16 zero bytes,
- *                        aad = Q_card || Q_peer || N_card || N_peer || 0x00)
+ *   K_conf  = HKDF-Expand(PRK, "SCvN-conf" || 0x01)[0..16)
+ *   K_msg   = HKDF-Expand(PRK, "SCvN-msg"  || 0x01)[0..32)
+ *   plus, for suite 02 only, MAC keys K_confmac ("SCv2-confmac") and
+ *   K_mac ("SCv2-mac"), each 32B; N = 1/2 per suite.
+ *   conf_token = seal under K_conf (and K_confmac for suite 02) of 16 zero
+ *        bytes, bound to the transcript
+ *   transcript = Q_card || Q_peer || N_card || N_peer || suite || dir
+ *        (dir = 0x00 client-&gt;card, 0x01 card-&gt;client)
  *   The card checks the token (key confirmation) and answers with its own
- *   token bound to direction byte 0x01. On success a session is active.
+ *   token. On success a session is active.
  *
  * PROTECTED COMMAND (e.g. INS 0xB0 SECRET_PING) -&gt;
- *   in:  iv (12B = N_card[0..4) || seq(8B, big endian, strictly increasing))
- *        || ciphertext || tag (16B)
- *   out: iv (12B = N_peer[0..4) || resp_seq(8B)) || ciphertext || tag (16B)
- *   aad (request)  = CLA || INS || P1 || P2 || Lc || iv   (17B)
- *   aad (response) = INS || iv                             (13B)
+ *   in:  iv (12/16B = N_card[0..4) || seq(8B, big endian, strictly increasing)
+ *        [|| 4 zero bytes for CBC]) || ciphertext || tag/mac (16B)
+ *   out: iv (12/16B = N_peer[0..4) || resp_seq(8B) [|| zeros]) || ct || 16B
+ *   Suite 01 (GCM): aad (request)  = CLA || INS || P1 || P2 || Lc || iv,
+ *                   aad (response) = INS || iv.
+ *   Suite 02 (CBC-HMAC, Encrypt-then-MAC, tag = HMAC truncated to 16B):
+ *                   mac input (request)  = CLA..Lc || iv || ct,
+ *                   mac input (response) = INS || iv || ct;
+ *                   verified BEFORE decrypting, so a bad MAC never decrypts
+ *                   and the padding is unreachable for an attacker.
  *   Only accepted while a session is active, otherwise 0x6982.
  *   Any integrity failure wipes the session (re-handshake required).
  * </pre>
@@ -60,9 +81,14 @@ import javacardx.crypto.Cipher;
  *
  * <ul>
  * <li>Forward secrecy: yes (ephemeral on both sides).</li>
- * <li>Mutual key confirmation: yes (tokens bound to the full transcript).</li>
+ * <li>Mutual key confirmation: yes (tokens bound to the full transcript,
+ * including the suite byte, so tokens cannot cross suites).</li>
  * <li>Replay protection: strictly increasing, direction-bound sequence
- * numbers authenticated via the IV inside the AAD.</li>
+ * numbers; the iv is bound via the GCM AAD (suite 01) or inside the MAC
+ * input (suite 02).</li>
+ * <li>Suite 02 is a fallback for cards without AEADCipher support; it is a
+ * standard Encrypt-then-MAC construction (never MAC-then-pad!), but GCM is
+ * the preferred suite where available.</li>
  * <li><b>Authentication against an active network attacker: NO.</b> Both
  * ECDH keys are ephemeral, so a MITM can run two handshakes. For
  * production, pin a card attestation key or add a static signed
@@ -82,16 +108,40 @@ public class SecureChannelApplet extends Applet {
 
   private static final short EC_POINT_LEN = 65;
   private static final short NONCE_LEN = 16;
-  private static final short IV_LEN = 12;
+  private static final short GCM_IV_LEN = 12;
+  private static final short CBC_IV_LEN = 16;
   private static final short TAG_LEN = 16;
   private static final short SEQ_LEN = 8;
   private static final short PREFIX_LEN = 4;
   private static final short HKDF_OUT_LEN = 32;
   private static final short SHA256_BLOCK_LEN = 64;
-  private static final short EXCHANGE_LC = EC_POINT_LEN + NONCE_LEN + IV_LEN
-      + HKDF_OUT_LEN / 2 + TAG_LEN; // = 125
   private static final short TOKEN_PT_LEN = 16;
-  private static final short TRANSRIPT_LEN = EC_POINT_LEN * 2 + NONCE_LEN * 2 + 1;
+  /** Token ciphertext under CBC: 16B plaintext + one ISO9797-M2 pad block. */
+  private static final short CBC_TOKEN_CT_LEN = 32;
+  // transcript = Q_card || Q_peer || N_card || N_peer || suite || direction
+  private static final short TRANSRIPT_LEN = EC_POINT_LEN * 2 + NONCE_LEN * 2 + 2;
+
+  // --- Cipher suites (chosen by the GP INSTALL parameter, no fallback) ----
+  //
+  // 0x01: AES-256-GCM (AEADCipher.ALG_AES_GCM), AAD = header || iv.
+  // 0x02: AES-256-CBC (ISO9797-M2 padding) + HMAC-SHA-256 Encrypt-then-MAC,
+  // MAC input = header || iv || ct, tag truncated to 16 bytes and
+  // verified before decryption. Payload layout iv || ct || mac is
+  // identical, so callers do not care.
+  //
+  // The suite is FIXED at instance creation: an instance never negotiates or
+  // downgrades. The suite byte is part of the handshake transcript, so keys,
+  // tokens and AAD are suite-bound and instances cannot be confused.
+
+  /** Install parameter: AES-256-GCM. */
+  private static final byte SUITE_GCM = (byte) 0x01;
+  /** Install parameter: AES-256-CBC + HMAC-SHA-256 (Encrypt-then-MAC). */
+  private static final byte SUITE_CBC_HMAC = (byte) 0x02;
+
+  /** No (or malformed) suite byte in the GP INSTALL data. */
+  private static final short SW_SUITE_PARAM_MISSING = (short) 0x9E01;
+  /** Suite byte present but not one of the known suites. */
+  private static final short SW_SUITE_PARAM_INVALID = (short) 0x9E02;
 
   // --- HKDF info labels (RFC 5869) ---------------------------------------
 
@@ -99,12 +149,20 @@ public class SecureChannelApplet extends Applet {
       'S', 'C', 'v', '1', '-', 'c', 'o', 'n', 'f'};
   private static final byte[] LABEL_MSG = {
       'S', 'C', 'v', '1', '-', 'm', 's', 'g'};
+  private static final byte[] L2_LABEL_CONF = {
+      'S', 'C', 'v', '2', '-', 'c', 'o', 'n', 'f'};
+  private static final byte[] L2_LABEL_CONF_MAC = {
+      'S', 'C', 'v', '2', '-', 'c', 'o', 'n', 'f', 'm', 'a', 'c'};
+  private static final byte[] L2_LABEL_MSG = {
+      'S', 'C', 'v', '2', '-', 'm', 's', 'g'};
+  private static final byte[] L2_LABEL_MAC = {
+      'S', 'C', 'v', '2', '-', 'm', 'a', 'c'};
 
   /** Known plaintext of the confirmation tokens (all zeros, length 16). */
   private static final byte[] CONF_PT = new byte[TOKEN_PT_LEN];
 
   // --- Install-time capability self test ------------------------------------
-  // install() probes every primitive this applet needs so that a card
+  // install() probes every primitive the CHOSEN suite needs so that a card
   // lacking one fails the GP INSTALL with a vendor SW of the form
   // 0x9F00 | bitmask (see bits below) instead of a generic error from deep
   // inside the constructor. Note: probe() runs before register(), so nothing
@@ -114,15 +172,17 @@ public class SecureChannelApplet extends Applet {
   private static final short SW_MISSING_ALGORITHMS = (short) 0x9F00;
 
   // Missing-primitive bitmask (combine freely; multiple bits may be set).
+  // Bits 0x20/0x40 refer to the cipher of the suite chosen via the install
+  // parameter (GCM or CBC+HMAC).
   private static final short MISS_SHA256 = 0x0001; // MessageDigest
   private static final short MISS_RANDOM = 0x0002; // RandomData
   private static final short MISS_EC_FP_256 = 0x0004; // EC FP-256 keypair
   private static final short MISS_ECDH_PLAIN = 0x0008; // ALG_EC_SVDP_DH_PLAIN
   private static final short MISS_AES_TRANSIENT = 0x0010; // AES *_TRANSIENT_DESELECT
-  private static final short MISS_GCM = 0x0020; // AEADCipher ALG_AES_GCM
-  private static final short MISS_GCM_KAT = 0x0040; // GCM round trip broken
+  private static final short MISS_CIPHER = 0x0020; // suite cipher unavailable
+  private static final short MISS_KAT = 0x0040; // suite cipher functional test broken
 
-  // Throwaway inputs for the GCM known-answer smoke test.
+  // Throwaway inputs for the cipher known-answer smoke tests.
   private static final byte[] KAT_KEY = {
       (byte) 0x00, (byte) 0x01, (byte) 0x02, (byte) 0x03, (byte) 0x04, (byte) 0x05,
       (byte) 0x06, (byte) 0x07, (byte) 0x08, (byte) 0x09, (byte) 0x0A, (byte) 0x0B,
@@ -136,13 +196,32 @@ public class SecureChannelApplet extends Applet {
   };
   private static final byte[] KAT_AAD = {'S', 'C', 'v', '1', 'k', 'a', 't'};
 
-  /** Layout of the 96-byte probe workspace. */
+  /** Layout of the 96-byte GCM probe workspace. */
   private static final short KAT_IV = 0; // 12
   private static final short KAT_CT = 12; // 16
   private static final short KAT_TAG = 28; // 16
   private static final short KAT_PT_OFF = 44; // 16
   private static final short KAT_AAD_OFF = 64; // 7
   private static final short KAT_OUT = 76; // 16
+
+  private static final byte[] KAT_MAC_KEY = {
+      (byte) 0xF0, (byte) 0xF1, (byte) 0xF2, (byte) 0xF3, (byte) 0xF4, (byte) 0xF5,
+      (byte) 0xF6, (byte) 0xF7, (byte) 0xF8, (byte) 0xF9, (byte) 0xFA, (byte) 0xFB,
+      (byte) 0xFC, (byte) 0xFD, (byte) 0xFE, (byte) 0xFF, (byte) 0xE0, (byte) 0xE1,
+      (byte) 0xE2, (byte) 0xE3, (byte) 0xE4, (byte) 0xE5, (byte) 0xE6, (byte) 0xE7,
+      (byte) 0xE8, (byte) 0xE9, (byte) 0xEA, (byte) 0xEB, (byte) 0xEC, (byte) 0xED,
+      (byte) 0xEE, (byte) 0xEF
+  };
+  private static final byte[] KAT_CBC_IV = {
+      'i', 'v', '4', 'c', 'b', 'c', 'k', 'a', 't', 0, 0, 0, 0, 0, 0, 0
+  };
+
+  /**
+   * Layout of the 256-byte CBC-HMAC probe workspace (wire at the far end so
+   * it never overlaps the HMAC pad||msg region).
+   */
+  private static final short KAT2_WIRE = 160; // seal writes iv||ct||mac (64)
+  private static final short KAT2_PT = 0; // open writes the plaintext back here
 
   // --- NIST P-256 (secp256r1) domain parameters --------------------------
 
@@ -189,14 +268,21 @@ public class SecureChannelApplet extends Applet {
   private ECPublicKey peerPub;
   private KeyPair ecdhKeyPair;
   private KeyAgreement ecdh;
+  /** Suite 1 only. */
   private AEADCipher gcm;
+  /** Suite 2 only. */
+  private Cipher cbc;
   private MessageDigest sha256;
   private RandomData random;
 
-  /** Session message key (AES-256), transient. */
+  /** Session message key (AES-256, GCM or CBC), transient. */
   private AESKey msgKey;
-  /** Handshake confirmation key (AES-128), transient. */
+  /** Handshake confirmation key (AES-128, GCM or CBC), transient. */
   private AESKey confKey;
+  /** Suite 2 payload MAC key (raw bytes - HMACKey is not portable), transient. */
+  private byte[] macKey;
+  /** Suite 2 confirmation-token MAC key, transient. */
+  private byte[] confMacKey;
 
   // --- State ---------------------------------------------------------------
 
@@ -220,33 +306,62 @@ public class SecureChannelApplet extends Applet {
 
   private boolean sessionActive;
 
+  /** Cipher suite fixed at install time; see SUITE_* constants. */
+  private final byte suite;
+  private final short ivLen;
+  private final short tokenCtLen;
+
   // ------------------------------------------------------------------------
 
   /**
-   * Fails with SW_MISSING_ALGORITHMS | bitmask if the card lacks a required
-   * primitive, so a broken deployment never registers a half-usable applet.
+   * The GP install parameter (one byte) selects the cipher suite
+   * ({@code 01} = GCM, {@code 02} = CBC+HMAC) and there is no default: an
+   * instance can never silently fall back to another algorithm. Fails with
+   * SW_MISSING_ALGORITHMS | bitmask if the card lacks a primitive of the
+   * chosen suite, so a broken deployment never registers a half-usable
+   * applet. Example: {@code gp --create ... --params 02}.
    */
   public static void install(byte[] bArray, short bOffset, byte bLength) {
-    short missing = probe();
+    byte suite = parseSuiteParam(bArray, bOffset);
+    short missing = probe(suite);
     if (missing != 0) {
       ISOException.throwIt((short) (SW_MISSING_ALGORITHMS | missing));
     }
-    new SecureChannelApplet().register(bArray, (short) (bOffset + 1),
+    new SecureChannelApplet(suite).register(bArray, (short) (bOffset + 1),
         bArray[bOffset]);
   }
 
   /**
-   * Checks that all primitives used by this applet are available and that
-   * AES-GCM works (round trip + tamper rejection via the same openGcm code
-   * path used at runtime). Availability probes only throw
+   * GP INSTALL data layout at bOffset: {@code [len][instance AID]
+   * [len][card capabilities][len][applet private data]}. The private data
+   * must be exactly one suite byte.
+   */
+  private static byte parseSuiteParam(byte[] bArray, short bOffset) {
+    short i = (short) (bOffset + 1 + (bArray[bOffset] & 0xFF)); // caps length
+    i += (short) (1 + (bArray[i] & 0xFF)); // private data length
+    short dataLen = (short) (bArray[i] & 0xFF);
+    if (dataLen != 1) {
+      ISOException.throwIt(SW_SUITE_PARAM_MISSING);
+    }
+    byte suite = bArray[(short) (i + 1)];
+    if (suite != SUITE_GCM && suite != SUITE_CBC_HMAC) {
+      ISOException.throwIt(SW_SUITE_PARAM_INVALID);
+    }
+    return suite;
+  }
+
+  /**
+   * Checks that all primitives shared by the suites are available and that
+   * the cipher of the chosen suite works (round trip + tamper rejection via
+   * the same open code path used at runtime). Availability probes only throw
    * CryptoException(NO_SUCH_ALGORITHM), which is cheap and side-effect free;
    * classic Java Card has no garbage collector, so probe() intentionally
    * leaks only a handful of small key/cipher objects and one transient
    * buffer — the price of failing install early with a good SW.
    *
-   * @return bitmask of missing primitives, 0 if the card is fully capable
+   * @return bitmask of missing primitives, 0 if the card can run the suite
    */
-  private static short probe() {
+  private static short probe(byte suite) {
     short missing = 0;
 
     try {
@@ -281,14 +396,32 @@ public class SecureChannelApplet extends Applet {
       missing |= MISS_AES_TRANSIENT;
     }
 
-    AEADCipher cipher = null;
-    try {
-      cipher = (AEADCipher) Cipher.getInstance(AEADCipher.ALG_AES_GCM, false);
-    } catch (CryptoException e) {
-      missing |= MISS_GCM;
-    }
-    if (cipher != null && !probeGcm(cipher)) {
-      missing |= MISS_GCM_KAT;
+    if (suite == SUITE_GCM) {
+      AEADCipher cipher = null;
+      try {
+        cipher = (AEADCipher) Cipher.getInstance(AEADCipher.ALG_AES_GCM, false);
+      } catch (CryptoException e) {
+        missing |= MISS_CIPHER;
+      }
+      if (cipher != null && !probeGcm(cipher)) {
+        missing |= MISS_KAT;
+      }
+    } else { // SUITE_CBC_HMAC
+      MessageDigest md = null;
+      try {
+        md = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+      } catch (CryptoException e) {
+        missing |= MISS_SHA256;
+      }
+      Cipher cbc = null;
+      try {
+        cbc = Cipher.getInstance(Cipher.ALG_AES_CBC_ISO9797_M2, false);
+      } catch (CryptoException e) {
+        missing |= MISS_CIPHER;
+      }
+      if (md != null && cbc != null && !probeCbcHmac(md, cbc)) {
+        missing |= MISS_KAT;
+      }
     }
     return missing;
   }
@@ -311,7 +444,7 @@ public class SecureChannelApplet extends Applet {
       Util.arrayCopyNonAtomic(KAT_AAD, (short) 0, ws, KAT_AAD_OFF,
           (short) KAT_AAD.length);
 
-      cipher.init(key, Cipher.MODE_ENCRYPT, ws, KAT_IV, IV_LEN);
+      cipher.init(key, Cipher.MODE_ENCRYPT, ws, KAT_IV, GCM_IV_LEN);
       cipher.updateAAD(ws, KAT_AAD_OFF, (short) KAT_AAD.length);
       cipher.doFinal(ws, KAT_PT_OFF, TOKEN_PT_LEN, ws, KAT_CT);
       cipher.retrieveTag(ws, KAT_TAG, TAG_LEN);
@@ -335,7 +468,53 @@ public class SecureChannelApplet extends Applet {
     }
   }
 
-  private SecureChannelApplet() {
+  /**
+   * CBC+HMAC smoke test: seal a known plaintext with the same
+   * sealCbcHmac()/openCbcHmac() code path the session uses, require the
+   * plaintext back, and require a flipped IV byte to be rejected by the
+   * MAC (the tag is checked before decryption, so nothing decrypts on a
+   * failed MAC). Detects runtimes that advertise CBC-M2 but implement it
+   * inconsistently.
+   */
+  private static boolean probeCbcHmac(MessageDigest md, Cipher cbc) {
+    byte[] ws = JCSystem.makeTransientByteArray((short) 256,
+        JCSystem.CLEAR_ON_RESET);
+    try {
+      AESKey encKey = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES,
+          KeyBuilder.LENGTH_AES_256, false);
+      encKey.setKey(KAT_KEY, (short) 0);
+
+      short wireLen = sealCbcHmac(md, cbc, encKey, KAT_MAC_KEY, ws,
+          KAT_AAD, (short) 0, (short) KAT_AAD.length, KAT_CBC_IV, (short) 0,
+          KAT_PT, (short) 0, TOKEN_PT_LEN, ws, KAT2_WIRE);
+      boolean shaped = wireLen == (short) (CBC_IV_LEN + CBC_TOKEN_CT_LEN
+          + TAG_LEN);
+
+      short ptLen = openCbcHmac(md, cbc, encKey, KAT_MAC_KEY, ws,
+          KAT_AAD, (short) 0, (short) KAT_AAD.length, ws, KAT2_WIRE,
+          (short) (KAT2_WIRE + CBC_IV_LEN), CBC_TOKEN_CT_LEN, ws, KAT2_PT);
+      boolean ok = shaped && ptLen == TOKEN_PT_LEN
+          && Util.arrayCompare(ws, KAT2_PT, KAT_PT, (short) 0, TOKEN_PT_LEN) == 0;
+
+      // A flipped iv byte must be rejected by the MAC check.
+      ws[KAT2_WIRE] ^= 1;
+      boolean rejected = openCbcHmac(md, cbc, encKey, KAT_MAC_KEY, ws,
+          KAT_AAD, (short) 0, (short) KAT_AAD.length, ws, KAT2_WIRE,
+          (short) (KAT2_WIRE + CBC_IV_LEN), CBC_TOKEN_CT_LEN, ws, KAT2_PT) < 0;
+
+      encKey.clearKey();
+      return ok && rejected;
+    } catch (CryptoException e) {
+      return false;
+    }
+  }
+
+  private SecureChannelApplet(byte suite) {
+    this.suite = suite;
+    this.ivLen = (short) (suite == SUITE_GCM ? GCM_IV_LEN : CBC_IV_LEN);
+    this.tokenCtLen = (short) (suite == SUITE_GCM
+        ? TOKEN_PT_LEN
+        : CBC_TOKEN_CT_LEN);
     ecdhPriv = (ECPrivateKey) KeyBuilder.buildKey(
         KeyBuilder.TYPE_EC_FP_PRIVATE, KeyBuilder.LENGTH_EC_FP_256, false);
     ecdhPub = (ECPublicKey) KeyBuilder.buildKey(
@@ -349,7 +528,11 @@ public class SecureChannelApplet extends Applet {
     ecdhKeyPair.genKeyPair();
 
     ecdh = KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN, false);
-    gcm = (AEADCipher) Cipher.getInstance(AEADCipher.ALG_AES_GCM, false);
+    if (suite == SUITE_GCM) {
+      gcm = (AEADCipher) Cipher.getInstance(AEADCipher.ALG_AES_GCM, false);
+    } else {
+      cbc = Cipher.getInstance(Cipher.ALG_AES_CBC_ISO9797_M2, false);
+    }
     sha256 = MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
     random = RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
 
@@ -357,6 +540,12 @@ public class SecureChannelApplet extends Applet {
         KeyBuilder.LENGTH_AES_256, false);
     confKey = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES_TRANSIENT_DESELECT,
         KeyBuilder.LENGTH_AES_128, false);
+    if (suite == SUITE_CBC_HMAC) {
+      macKey = JCSystem.makeTransientByteArray(HKDF_OUT_LEN,
+          JCSystem.CLEAR_ON_DESELECT);
+      confMacKey = JCSystem.makeTransientByteArray(HKDF_OUT_LEN,
+          JCSystem.CLEAR_ON_DESELECT);
+    }
 
     nCard = JCSystem.makeTransientByteArray(NONCE_LEN,
         JCSystem.CLEAR_ON_DESELECT);
@@ -375,7 +564,11 @@ public class SecureChannelApplet extends Applet {
     lastRxSeq = JCSystem.makeTransientByteArray(SEQ_LEN,
         JCSystem.CLEAR_ON_DESELECT);
     txSeq = JCSystem.makeTransientByteArray(SEQ_LEN, JCSystem.CLEAR_ON_DESELECT);
-    decBuf = JCSystem.makeTransientByteArray((short) 256,
+    // decBuf doubles as pad||staged-MAC-input workspace for suite 2; 384 B
+    // covers the largest payload a short APDU can carry (64 pad + 244 mac
+    // input + 32 MAC tail). Suite 1 keeps the lean 256.
+    decBuf = JCSystem.makeTransientByteArray(
+        suite == SUITE_GCM ? (short) 256 : (short) 384,
         JCSystem.CLEAR_ON_DESELECT);
     hmacInner = JCSystem.makeTransientByteArray(HKDF_OUT_LEN,
         JCSystem.CLEAR_ON_DESELECT);
@@ -436,7 +629,9 @@ public class SecureChannelApplet extends Applet {
     byte[] buffer = apdu.getBuffer();
     short len = ecdhPub.getW(buffer, (short) 0);
     Util.arrayCopyNonAtomic(nCard, (short) 0, buffer, len, NONCE_LEN);
-    apdu.setOutgoingAndSend((short) 0, (short) (len + NONCE_LEN));
+    // Echo the suite byte so the host derives matching keys.
+    buffer[(short) (len + NONCE_LEN)] = suite;
+    apdu.setOutgoingAndSend((short) 0, (short) (len + NONCE_LEN + 1));
   }
 
   // --- EXCHANGE -----------------------------------------------------------
@@ -446,7 +641,9 @@ public class SecureChannelApplet extends Applet {
     short lc = apdu.setIncomingAndReceive();
     short cdata = ISO7816.OFFSET_CDATA;
 
-    if (lc != EXCHANGE_LC || buffer[cdata] != 0x04) {
+    short expectedLc = (short) (EC_POINT_LEN + NONCE_LEN + ivLen + tokenCtLen
+        + TAG_LEN);
+    if (lc != expectedLc || buffer[cdata] != 0x04) {
       ISOException.throwIt(ISO7816.SW_WRONG_DATA);
     }
 
@@ -471,18 +668,29 @@ public class SecureChannelApplet extends Applet {
 
     hkdfExtract(zLen);
 
-    // K_conf -> confKey, K_msg -> msgKey
-    hkdfExpand(LABEL_CONF, (short) 0, tmp);
-    confKey.setKey(tmp, (short) 0);
-    Util.arrayFillNonAtomic(tmp, (short) 0, HKDF_OUT_LEN, (byte) 0);
-    hkdfExpand(LABEL_MSG, (short) 0, tmp);
-    msgKey.setKey(tmp, (short) 0);
+    // Derive the suite's keys: token enc + token mac, payload enc + payload
+    // mac (the *mac labels only exist for suite 2).
+    if (suite == SUITE_GCM) {
+      hkdfExpand(LABEL_CONF, (short) 0, tmp);
+      confKey.setKey(tmp, (short) 0);
+      Util.arrayFillNonAtomic(tmp, (short) 0, HKDF_OUT_LEN, (byte) 0);
+      hkdfExpand(LABEL_MSG, (short) 0, tmp);
+      msgKey.setKey(tmp, (short) 0);
+    } else {
+      hkdfExpand(L2_LABEL_CONF, (short) 0, tmp);
+      confKey.setKey(tmp, (short) 0);
+      Util.arrayFillNonAtomic(tmp, (short) 0, HKDF_OUT_LEN, (byte) 0);
+      hkdfExpand(L2_LABEL_CONF_MAC, (short) 0, confMacKey);
+      hkdfExpand(L2_LABEL_MSG, (short) 0, tmp);
+      msgKey.setKey(tmp, (short) 0);
+      hkdfExpand(L2_LABEL_MAC, (short) 0, macKey);
+    }
     Util.arrayFillNonAtomic(tmp, (short) 0, HKDF_OUT_LEN, (byte) 0);
     Util.arrayFillNonAtomic(prk, (short) 0, HKDF_OUT_LEN, (byte) 0);
     // Scrub HMAC key-schedule scratch (derived from salt/PRK).
     Util.arrayFillNonAtomic(hmacInner, (short) 0, HKDF_OUT_LEN, (byte) 0);
 
-    // transcript = Q_card || Q_peer || N_card || N_peer
+    // transcript = Q_card || Q_peer || N_card || N_peer || suite || dir
     short off = (short) 0;
     ecdhPub.getW(transcript, off);
     off += EC_POINT_LEN;
@@ -493,15 +701,15 @@ public class SecureChannelApplet extends Applet {
     Util.arrayCopyNonAtomic(buffer, (short) (cdata + EC_POINT_LEN), transcript,
         off, NONCE_LEN);
     off += NONCE_LEN;
-    transcript[off] = 0x00; // direction: client -> card
+    transcript[off] = suite;
+    transcript[(short) (off + 1)] = 0x00; // direction: client -> card
 
     short ivOff = (short) (cdata + EC_POINT_LEN + NONCE_LEN);
-    short ctOff = (short) (ivOff + IV_LEN);
+    short ctOff = (short) (ivOff + ivLen);
 
-    // Verify the client confirmation token (see gcmOpen() for why decrypting
-    // needs a runtime-portability dance).
-    if (!gcmOpen(confKey, transcript, (short) 0, TRANSRIPT_LEN, buffer, ivOff,
-        ctOff, TOKEN_PT_LEN)
+    // Verify the client confirmation token bound to the suite.
+    if (openMsg(confKey, confMacKey, transcript, (short) 0, TRANSRIPT_LEN,
+        buffer, ivOff, ctOff, tokenCtLen) != TOKEN_PT_LEN
         || Util.arrayCompare(decBuf, (short) 0, CONF_PT, (short) 0,
             TOKEN_PT_LEN) != 0) {
       wipeSession();
@@ -518,13 +726,11 @@ public class SecureChannelApplet extends Applet {
 
     // Build card confirmation token (direction byte 0x01).
     transcript[TRANSRIPT_LEN - 1] = 0x01;
-    random.nextBytes(scratch, (short) 0, IV_LEN);
-    gcm.init(confKey, Cipher.MODE_ENCRYPT, scratch, (short) 0, IV_LEN);
-    gcm.updateAAD(transcript, (short) 0, TRANSRIPT_LEN);
-    gcm.doFinal(CONF_PT, (short) 0, TOKEN_PT_LEN, buffer, IV_LEN);
-    gcm.retrieveTag(buffer, (short) (IV_LEN + TOKEN_PT_LEN), TAG_LEN);
-    Util.arrayCopyNonAtomic(scratch, (short) 0, buffer, (short) 0, IV_LEN);
-    apdu.setOutgoingAndSend((short) 0, (short) (IV_LEN + TOKEN_PT_LEN + TAG_LEN));
+    random.nextBytes(scratch, (short) 0, ivLen);
+    short sent = seal(confKey, confMacKey, transcript, (short) 0,
+        TRANSRIPT_LEN, scratch, (short) 0, CONF_PT, (short) 0, TOKEN_PT_LEN,
+        buffer, (short) 0);
+    apdu.setOutgoingAndSend((short) 0, sent);
   }
 
   // --- Protected command ---------------------------------------------------
@@ -540,7 +746,7 @@ public class SecureChannelApplet extends Applet {
 
     byte[] buffer = apdu.getBuffer();
     short lc = apdu.setIncomingAndReceive();
-    if (lc < IV_LEN + TAG_LEN) {
+    if (lc < (short) (ivLen + TAG_LEN)) {
       ISOException.throwIt(ISO7816.SW_WRONG_DATA);
     }
 
@@ -553,12 +759,16 @@ public class SecureChannelApplet extends Applet {
       ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
     }
 
-    // Payload = iv (12B) || ct || tag (16B). aad = header (CLA..Lc, 5B) || iv,
-    // which is contiguous here because the iv starts at OFFSET_CDATA.
-    short ctLen = (short) (lc - IV_LEN - TAG_LEN);
-    short aadLen = (short) (ISO7816.OFFSET_CDATA + IV_LEN);
-    if (!gcmOpen(msgKey, buffer, (short) 0, aadLen, buffer, ivOff,
-        (short) (ivOff + IV_LEN), ctLen)) {
+    // Payload = iv || ct || tag/mac. Suite 1 binds the iv via the GCM AAD
+    // (header || iv); suite 2 via the MAC input (header || iv || ct) - both
+    // contiguous in the APDU buffer because the iv starts at OFFSET_CDATA.
+    short ctLen = (short) (lc - ivLen - TAG_LEN);
+    short aadLen = (suite == SUITE_GCM)
+        ? (short) (ISO7816.OFFSET_CDATA + GCM_IV_LEN)
+        : ISO7816.OFFSET_CDATA;
+    short ptLen = openMsg(msgKey, macKey, buffer, (short) 0, aadLen, buffer,
+        ivOff, (short) (ivOff + ivLen), ctLen);
+    if (ptLen <= 0) {
       wipeSession();
       ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
     }
@@ -566,24 +776,28 @@ public class SecureChannelApplet extends Applet {
     Util.arrayCopyNonAtomic(buffer, (short) (ivOff + PREFIX_LEN), lastRxSeq,
         (short) 0, SEQ_LEN);
 
-    // Response: aad = INS || iv_resp, iv_resp = N_peer[0..4) || txSeq++
+    // Response: aad = INS || iv_resp (suite 1) or INS (suite 2), iv_resp =
+    // N_peer[0..4) || txSeq++ (|| 4 zero bytes to fill the 16B CBC iv).
     increment(txSeq, (short) 0);
     scratch[0] = buffer[ISO7816.OFFSET_INS];
-    Util.arrayCopyNonAtomic(txPrefix, (short) 0, scratch, (short) 1, PREFIX_LEN);
+    Util.arrayCopyNonAtomic(txPrefix, (short) 0, scratch, (short) 1,
+        PREFIX_LEN);
     Util.arrayCopyNonAtomic(txSeq, (short) 0, scratch, (short) 5, SEQ_LEN);
+    if (suite != SUITE_GCM) {
+      Util.arrayFillNonAtomic(scratch, (short) (1 + PREFIX_LEN + SEQ_LEN),
+          (short) (CBC_IV_LEN - PREFIX_LEN - SEQ_LEN), (byte) 0);
+    }
 
+    short respAadLen = (suite == SUITE_GCM) ? (short) (1 + GCM_IV_LEN) : 1;
     try {
-      gcm.init(msgKey, Cipher.MODE_ENCRYPT, scratch, (short) 1, IV_LEN);
-      gcm.updateAAD(scratch, (short) 0, (short) (1 + IV_LEN));
-      gcm.doFinal(decBuf, (short) 0, ctLen, buffer, IV_LEN);
-      gcm.retrieveTag(buffer, (short) (IV_LEN + ctLen), TAG_LEN);
+      short sent = seal(msgKey, macKey, scratch, (short) 0, respAadLen,
+          scratch, (short) 1, decBuf, (short) 0, ptLen, buffer, (short) 0);
+      apdu.setOutgoingAndSend((short) 0, sent);
     } catch (CryptoException e) {
       wipeSession();
       ISOException.throwIt(ISO7816.SW_SECURITY_STATUS_NOT_SATISFIED);
       return; // not reached
     }
-    Util.arrayCopyNonAtomic(scratch, (short) 1, buffer, (short) 0, IV_LEN);
-    apdu.setOutgoingAndSend((short) 0, (short) (IV_LEN + ctLen + TAG_LEN));
   }
 
   // --- Helpers -------------------------------------------------------------
@@ -624,13 +838,136 @@ public class SecureChannelApplet extends Applet {
    * exact same code path. Plaintext lands in out[outOff..outOff+ctLen);
    * that region must not overlap iv/ct/tag in `in`.
    */
+  /**
+   * Seal pt as iv || ct || tag into out[outOff..], iv taken from
+   * ivBuf[ivOff..ivOff+GCM_IV_LEN). Returns the total written length. ivBuf
+   * must not overlap out (callers keep the iv in scratch).
+   */
+  private static short sealGcm(AEADCipher cipher, AESKey key, byte[] aadBuf,
+      short aadOff, short aadLen, byte[] ivBuf, short ivOff, byte[] pt,
+      short ptOff, short ptLen, byte[] out, short outOff) {
+    cipher.init(key, Cipher.MODE_ENCRYPT, ivBuf, ivOff, GCM_IV_LEN);
+    cipher.updateAAD(aadBuf, aadOff, aadLen);
+    cipher.doFinal(pt, ptOff, ptLen, out, (short) (outOff + GCM_IV_LEN));
+    // jcardsim's ENCRYPT doFinal appends the tag right there; retrieveTag
+    // then overwrites the identical region on every runtime.
+    cipher.retrieveTag(out, (short) (outOff + GCM_IV_LEN + ptLen), TAG_LEN);
+    Util.arrayCopyNonAtomic(ivBuf, ivOff, out, outOff, GCM_IV_LEN);
+    return (short) (GCM_IV_LEN + ptLen + TAG_LEN);
+  }
+
+  /**
+   * Seal pt as iv || ct || mac for suite 2: AES-256-CBC with ISO9797-M2
+   * padding, Encrypt-then-MAC over {@code aad || iv || ct} (the iv is bound
+   * explicitly because, unlike GCM, CBC does not authenticate it), HMAC-SHA-
+   * 256 truncated to TAG_LEN. ivBuf must not overlap out.
+   *
+   * <p>{@code ws} doubles as pad||staged-MAC-input workspace plus a 32-byte
+   * tail slot used for the inner digest and the MAC output; must satisfy
+   * 64 + aadLen + 16 + ctLen(padded) + 32 bytes, checked at runtime.
+   */
+  private static short sealCbcHmac(MessageDigest md, Cipher cbc,
+      AESKey encKey, byte[] macKey, byte[] ws, byte[] aadBuf, short aadOff,
+      short aadLen, byte[] ivBuf, short ivOff, byte[] pt, short ptOff,
+      short ptLen, byte[] out, short outOff) {
+    Util.arrayCopyNonAtomic(ivBuf, ivOff, out, outOff, CBC_IV_LEN);
+    cbc.init(encKey, Cipher.MODE_ENCRYPT, ivBuf, ivOff, CBC_IV_LEN);
+    short ctLen = cbc.doFinal(pt, ptOff, ptLen, out,
+        (short) (outOff + CBC_IV_LEN));
+    short macLen = (short) (aadLen + CBC_IV_LEN + ctLen);
+    short macOff = (short) (ws.length - HKDF_OUT_LEN);
+    if ((short) (SHA256_BLOCK_LEN + macLen + HKDF_OUT_LEN) > ws.length) {
+      CryptoException.throwIt(CryptoException.ILLEGAL_USE); // callers wipe
+    }
+    // Stage aad || iv || ct at ws[64..); iv || ct are contiguous in `out`.
+    Util.arrayCopyNonAtomic(aadBuf, aadOff, ws, SHA256_BLOCK_LEN, aadLen);
+    Util.arrayCopyNonAtomic(out, outOff, ws,
+        (short) (SHA256_BLOCK_LEN + aadLen), (short) (CBC_IV_LEN + ctLen));
+    hmacFromWorkspace(md, ws, ws, macOff, macKey, (short) 0, HKDF_OUT_LEN,
+        macLen, ws, macOff);
+    Util.arrayCopyNonAtomic(ws, macOff, out,
+        (short) (outOff + CBC_IV_LEN + ctLen), TAG_LEN);
+    return (short) (CBC_IV_LEN + ctLen + TAG_LEN);
+  }
+
+  /**
+   * Open a suite-2 payload iv || ct || mac (iv at ivOff, ct at
+   * ctOff == ivOff + CBC_IV_LEN, mac right after ct, all within `in`). The
+   * MAC is checked BEFORE decrypting (constant-time via arrayCompare), so a
+   * failed MAC never decrypts and never leaks padding behaviour.
+   *
+   * @return plaintext length (M2 padding stripped) in out[outOff..], or -1
+   *         if the MAC does not validate or padding is broken
+   */
+  private static short openCbcHmac(MessageDigest md, Cipher cbc,
+      AESKey encKey, byte[] macKey, byte[] ws, byte[] aadBuf, short aadOff,
+      short aadLen, byte[] in, short ivOff, short ctOff, short ctLen,
+      byte[] out, short outOff) {
+    short macLen = (short) (aadLen + CBC_IV_LEN + ctLen);
+    short macOff = (short) (ws.length - HKDF_OUT_LEN);
+    if ((short) (SHA256_BLOCK_LEN + macLen + HKDF_OUT_LEN) > ws.length
+        || ctOff != (short) (ivOff + CBC_IV_LEN)) {
+      return -1;
+    }
+    // Stage aad || iv || ct at ws[64..); iv || ct are contiguous in `in`.
+    Util.arrayCopyNonAtomic(aadBuf, aadOff, ws, SHA256_BLOCK_LEN, aadLen);
+    Util.arrayCopyNonAtomic(in, ivOff, ws,
+        (short) (SHA256_BLOCK_LEN + aadLen), (short) (CBC_IV_LEN + ctLen));
+    hmacFromWorkspace(md, ws, ws, macOff, macKey, (short) 0, HKDF_OUT_LEN,
+        macLen, ws, macOff);
+    if (Util.arrayCompare(ws, macOff, in, (short) (ctOff + ctLen), TAG_LEN) != 0) {
+      return -1;
+    }
+    cbc.init(encKey, Cipher.MODE_DECRYPT, in, ivOff, CBC_IV_LEN);
+    try {
+      return cbc.doFinal(in, ctOff, ctLen, out, outOff);
+    } catch (CryptoException paddingBroken) {
+      // Valid MAC but malformed M2 padding - reject anyway.
+      return -1;
+    }
+  }
+
+  /**
+   * Suite-aware seal: writes iv || ct || tag/mac into out[outOff..] and
+   * returns the total length. macKeyBuf is only used by suite 2.
+   */
+  private short seal(AESKey encKey, byte[] macKeyBuf, byte[] aadBuf,
+      short aadOff, short aadLen, byte[] ivBuf, short ivOff, byte[] pt,
+      short ptOff, short ptLen, byte[] out, short outOff) {
+    if (suite == SUITE_GCM) {
+      return sealGcm(gcm, encKey, aadBuf, aadOff, aadLen, ivBuf, ivOff, pt,
+          ptOff, ptLen, out, outOff);
+    }
+    return sealCbcHmac(sha256, cbc, encKey, macKeyBuf, decBuf, aadBuf, aadOff,
+        aadLen, ivBuf, ivOff, pt, ptOff, ptLen, out, outOff);
+  }
+
+  /**
+   * Suite-aware open of iv || ct || tag/mac from `in`; plaintext lands in
+   * decBuf[0..).
+   *
+   * @return plaintext length, or -1 on authentication failure (suite 1
+   *         reports ctLen on success)
+   */
+  private short openMsg(AESKey encKey, byte[] macKeyBuf, byte[] aadBuf,
+      short aadOff, short aadLen, byte[] in, short ivOff, short ctOff,
+      short ctLen) {
+    if (suite == SUITE_GCM) {
+      return gcmOpen(encKey, aadBuf, aadOff, aadLen, in, ivOff, ctOff, ctLen)
+          ? ctLen
+          : (short) -1;
+    }
+    return openCbcHmac(sha256, cbc, encKey, macKeyBuf, decBuf, aadBuf, aadOff,
+        aadLen, in, ivOff, ctOff, ctLen, decBuf, (short) 0);
+  }
+
   private static boolean openGcm(AEADCipher cipher, AESKey key,
       byte[] aadBuf, short aadOff, short aadLen, byte[] in, short ivOff,
       short ctOff, short ctLen, byte[] out, short outOff) {
     short tagOff = (short) (ctOff + ctLen);
     try {
       // Spec form: doFinal(ct) -> pt, then verifyTag(wire tag).
-      cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
+      cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, GCM_IV_LEN);
       cipher.updateAAD(aadBuf, aadOff, aadLen);
       short dlen = cipher.doFinal(in, ctOff, ctLen, out, outOff);
       return dlen == ctLen
@@ -638,7 +975,7 @@ public class SecureChannelApplet extends Applet {
     } catch (CryptoException specMismatch) {
       try {
         // jcardsim/BC form: doFinal(ct || tag), tag verified internally.
-        cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
+        cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, GCM_IV_LEN);
         cipher.updateAAD(aadBuf, aadOff, aadLen);
         short dlen = cipher.doFinal(in, ctOff, (short) (ctLen + TAG_LEN), out,
             outOff);
@@ -685,29 +1022,49 @@ public class SecureChannelApplet extends Applet {
    */
   private void hmacSha256(byte[] key, short keyOff, short keyLen, byte[] msg,
       short msgOff, short msgLen, byte[] out, short outOff) {
-    // Keys in this protocol (HKDF salt and PRK) are always <= hash block
-    // size, so per RFC 2104 the padded key K' is just the key zero-extended
-    // to 64 bytes. A single-shot digest over a combined buffer is used
-    // (instead of update() + doFinal()) because multi-part MessageDigest
-    // behaviour is not uniform across runtimes.
-    //
+    hmacSha256(sha256, decBuf, hmacInner, key, keyOff, keyLen, msg, msgOff,
+        msgLen, out, outOff);
+  }
+
+  /**
+   * Static HMAC-SHA-256 core (RFC 2104) over a contiguous message. {@code ws}
+   * is the pad||message workspace (at least 64 + msgLen bytes) and
+   * {@code inner} a 32-byte scratch; the caller supplies both so the same
+   * routine serves HKDF (during handshake) and the CBC-HMAC suite.
+   */
+  private static void hmacSha256(MessageDigest md, byte[] ws, byte[] inner,
+      byte[] key, short keyOff, short keyLen, byte[] msg, short msgOff,
+      short msgLen, byte[] out, short outOff) {
+    Util.arrayCopyNonAtomic(msg, msgOff, ws, SHA256_BLOCK_LEN, msgLen);
+    hmacFromWorkspace(md, ws, inner, (short) 0, key, keyOff, keyLen, msgLen,
+        out, outOff);
+  }
+
+  /**
+   * HMAC-SHA-256 over a message already staged at ws[64..64+msgLen); ws must
+   * be at least 64 + msgLen bytes. Keys in this protocol are always <= the
+   * hash block size, so per RFC 2104 the padded key K' is the key
+   * zero-extended to 64 bytes. Single-shot digests are used (instead of
+   * update() + doFinal()) because multi-part MessageDigest behaviour is not
+   * uniform across runtimes.
+   */
+  private static void hmacFromWorkspace(MessageDigest md, byte[] ws,
+      byte[] innerBuf, short innerOff, byte[] key, short keyOff,
+      short keyLen, short msgLen, byte[] out, short outOff) {
     // inner = H((K' ^ ipad) || msg)
+    fillPadBlock(ws, key, keyOff, keyLen, (byte) 0x36);
+    md.doFinal(ws, (short) 0, (short) (SHA256_BLOCK_LEN + msgLen), innerBuf,
+        innerOff);
     // out = H((K' ^ opad) || inner)
-    //
-    // decBuf (256B, unused while HKDF runs) is the pad||message workspace.
-    fillPadBlock(decBuf, key, keyOff, keyLen, (byte) 0x36);
-    Util.arrayCopyNonAtomic(msg, msgOff, decBuf, SHA256_BLOCK_LEN, msgLen);
-    sha256.doFinal(decBuf, (short) 0, (short) (SHA256_BLOCK_LEN + msgLen),
-        hmacInner, (short) 0);
-    fillPadBlock(decBuf, key, keyOff, keyLen, (byte) 0x5c);
-    Util.arrayCopyNonAtomic(hmacInner, (short) 0, decBuf, SHA256_BLOCK_LEN,
+    fillPadBlock(ws, key, keyOff, keyLen, (byte) 0x5c);
+    Util.arrayCopyNonAtomic(innerBuf, innerOff, ws, SHA256_BLOCK_LEN,
         HKDF_OUT_LEN);
-    sha256.doFinal(decBuf, (short) 0,
-        (short) (SHA256_BLOCK_LEN + HKDF_OUT_LEN), out, outOff);
+    md.doFinal(ws, (short) 0, (short) (SHA256_BLOCK_LEN + HKDF_OUT_LEN), out,
+        outOff);
   }
 
   /** Writes key zero-padded to 64 bytes XOR pad into dst[0..64). */
-  private void fillPadBlock(byte[] dst, byte[] key, short keyOff,
+  private static void fillPadBlock(byte[] dst, byte[] key, short keyOff,
       short keyLen, byte pad) {
     short i;
     for (i = (short) 0; i < keyLen; i++) {
@@ -741,6 +1098,10 @@ public class SecureChannelApplet extends Applet {
     Util.arrayFillNonAtomic(salt, (short) 0, HKDF_OUT_LEN, (byte) 0);
     Util.arrayFillNonAtomic(tmp, (short) 0, HKDF_OUT_LEN, (byte) 0);
     Util.arrayFillNonAtomic(hmacInner, (short) 0, HKDF_OUT_LEN, (byte) 0);
+    if (macKey != null) {
+      Util.arrayFillNonAtomic(macKey, (short) 0, HKDF_OUT_LEN, (byte) 0);
+      Util.arrayFillNonAtomic(confMacKey, (short) 0, HKDF_OUT_LEN, (byte) 0);
+    }
     Util.arrayFillNonAtomic(decBuf, (short) 0, (short) decBuf.length, (byte) 0);
     try {
       msgKey.clearKey();
