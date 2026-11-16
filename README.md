@@ -40,6 +40,7 @@ JavaCard distinguishes three AIDs. In this project they are:
 | Package AID | `0102030405` | Derived from the first 5 bytes of `<applet.id>`; exposed as the `${package.id}` property |
 | Applet AID | `010203040506` | Your `<applet.id>`; stored in the CAP's applet component |
 | Instance AID | `010203040506` | Assigned at install time; a default `gp --install` (and jCardSim's `installApplet`) uses the applet AID |
+| Second applet | `010203040507` | `<applet.id.secure>` — `SecureChannelApplet`, same package and CAP (see "Secure channel applet") |
 
 `SELECT` always targets the *instance* AID — `010203040506` here:
 
@@ -53,6 +54,95 @@ Integration tests receive all values as system properties injected by the parent
 
 See [AIDs](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.5.0/README-javacard.md#aids)
 for the background on all three.
+
+# Secure channel applet (ECDH + HKDF + AES-256-GCM)
+
+`helloworld.SecureChannelApplet` (instance AID `010203040507`, same CAP as
+`HelloWorldApplet`) establishes an encrypted, integrity-protected application
+channel between a phone app and the card — applet-level, independent of the
+GlobalPlatform SCP02 management channel.
+
+## Protocol v1
+
+All commands use `CLA = 0x80`. Curve is secp256r1 (`P-256`), domain parameters
+pinned in the applet.
+
+| INS | Name | Direction | Payload |
+|---|---|---|---|
+| `0x10` | INIT | → card | — |
+| | | ← card | `Q_card (65B) \|\| N_card (16B)` |
+| `0x12` | EXCHANGE | → card | `Q_peer (65B) \|\| N_peer (16B) \|\| iv (12B) \|\| ct (16B) \|\| tag (16B)` |
+| | | ← card | `iv (12B) \|\| ct (16B) \|\| tag (16B)` |
+| `0xB0` | SECRET_PING | → card | `iv (12B) \|\| ct \|\| tag (16B)` (echo demo for protected commands) |
+
+Key derivation after both nonces are known:
+
+```
+Z      = ECDH(d_card, Q_peer)                    (KeyAgreement ALG_EC_SVDP_DH_PLAIN)
+salt   = N_card || N_peer
+PRK    = HKDF-Extract(salt, Z)                   (HMAC-SHA-256)
+K_conf = HKDF-Expand(PRK, "SCv1-conf")[0..16)    AES-128, handshake tokens only
+K_msg  = HKDF-Expand(PRK, "SCv1-msg")[0..32)     AES-256, session messages
+```
+
+EXCHANGE carries a key-confirmation token — AES-GCM under `K_conf` over the
+transcript `Q_card || Q_peer || N_card || N_peer || dir` as AAD — and the card
+answers with its own token (direction byte flipped). On success the session is
+active; the keys live in transient `AESKey` objects.
+
+Protected commands use `K_msg`. The 12-byte IV is `prefix (4B) || seq (8B,
+big-endian, strictly increasing)` with per-direction prefixes taken from the
+session nonces; the IV and the APDU header are bound into the GCM AAD, which
+gives replay and reordering protection. `0x6982
+SECURITY_STATUS_NOT_SATISFIED` is returned when: no session is active, a
+command arrives without/before its sequence, or integrity fails. **Any
+integrity failure wipes the session** — the phone must redo INIT/EXCHANGE.
+Deselecting the applet also wipes the session (transient keys and arrays).
+
+## Protected commands for your own instructions
+
+`SECRET_PING` is a template: call `requireSession()` first, then reuse the
+AAD/IV scheme from `secretPing()` (or lift its open/seal parts into helpers)
+for each instruction you want to guard. Non-protected instructions (like
+`INIT`/`EXCHANGE`) stay open by design.
+
+## Limitations (read before production use!)
+
+- **No entity authentication.** Both ECDH keys are ephemeral, so an active
+  network attacker can run two handshakes (MITM). Mitigation options: pin a
+  static card key and sign the handshake (`Signature ALG_ECDSA_SHA_256`), or
+  provision per-card secrets out-of-band.
+- GCM support is optional in Java Card 3.0.5 — probe it on your target card,
+  e.g. with a tiny self-test INS calling
+  `AEADCipher.getInstance(AEADCipher.ALG_AES_GCM, false)`. The AEADCipher
+  *decrypt* contract also varies between runtimes: the spec (and the Oracle
+  simulator / real cards) uses `doFinal(ciphertext)` -> plaintext followed by
+  `verifyTag(wireTag)` -> boolean, while jCardSim implements the JCE/BC-style
+  `doFinal(ct || tag)` with internal verification. `gcmOpen()` tries the spec
+  form first and retries the BC form only after a `CryptoException`; on a
+  spec-compliant runtime that fallback can never authenticate a forged
+  message (their `doFinal` is n -> n, so the retry sees `ctLen + 16` bytes and
+  is rejected). Verified end-to-end on the Oracle simulator v26 and jCardSim.
+- HMAC-SHA-256 is built on `MessageDigest.ALG_SHA_256` (RFC 2104, one-shot)
+  instead of `Signature.ALG_HMAC_SHA_256` + `HMACKey`: runtimes disagree on
+  the unit of `KeyBuilder.buildKey(..., TYPE_HMAC, len)` (the Oracle simulator
+  reads it as *bits*, jCardSim as *bytes*, which rejects `setKey` of a 32-byte
+  key), and the 4-arg `buildKey` variant with `ALG_TYPE_HMAC` is not supported
+  there at all. The manual construction sidesteps this entirely (all keys here
+  are ≤ block size, so no long-key hashing path is needed).
+- `KeyPair.genKeyPair()` on INIT can take hundreds of ms on real silicon.
+
+## Build plumbing for two applets in one CAP
+
+The jcdk plugin normally converts exactly one applet. When
+`target/generated-jcdk/jcdk.config` already exists it is passed to the
+converter verbatim, so `src/main/jcdk/jcdk.config` (a filtered Maven resource,
+see the `generate-jcdk-config` execution) declares both `-applet` entries.
+Keep the `jcdk.aid.*` properties in `pom.xml` in sync with
+`<applet.id>` / `<applet.id.secure>`.
+
+`SecureChannelClient` (test scope) is a plain-JCE reference implementation of
+the phone side — Android can use the same primitives.
 
 # Build
 
@@ -104,10 +194,40 @@ command. This local configuration file is ignored by Git.
 `src/test-integration/java` in a package containing `.integration.`.
 Surefire excludes these tests; Failsafe runs them during `verify`.
 
-This example currently has three integration tests and no separate unit tests.
+This example currently has twelve integration tests (three for Hello World,
+nine for the secure channel) and no separate unit tests.
 Results are written to `target/failsafe-reports/`, with an HTML report at
 `target/reports/tests-integration.html`. A warning about missing unit-test report
 input is expected because there are no unit tests.
+
+## Oracle simulator smoke test
+
+`simulator/OracleSimulatorSmokeTest.java` exercises the built CAP end-to-end on
+the real Oracle Java Card simulator (v26.0) inside a
+[docker-javacard](https://github.com/andreas-mausch/docker-javacard) container:
+selects both applets, runs a full handshake, protected round trips, replay and
+tamper rejection and checks that deselecting wipes the session. It is a
+dependency-free single-file program (`javax.smartcardio` + JCE) that is compiled
+inside the container:
+
+```bash
+docker run --rm \
+  --volume "$PWD/target/010203040506.cap:/applet/helloworld.cap:ro" \
+  --volume "$PWD/simulator:/simulator:ro" \
+  --env GLOBALPLATFORMPRO_VERSION=25.10.20 \
+  --env START_JAVACARD_SIMULATOR=y docker-javacard bash -ec '
+    gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }
+    unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK
+    gp --install ./helloworld.cap --applet 010203040506
+    gp --create 010203040507 --package 0102030405 --applet 010203040507
+    javac -d /tmp/smoke /simulator/OracleSimulatorSmokeTest.java
+    java -cp /tmp/smoke OracleSimulatorSmokeTest'
+```
+
+Two notes on installing a CAP that contains two applets: `gp --install`
+refuses it without `--applet <AID>` (the AID, not the class name), and the
+second instance must be created with `gp --create` — a second `gp --install`
+tries to reload the package, which the simulator rejects with `0x6985`.
 
 # Linting and formatting
 
@@ -269,9 +389,11 @@ its signatures are not trusted release signatures.
 The additional Oracle simulator job is opt-in: start the workflow manually with
 `run_simulator` enabled and set `ORACLE_JAVACARD_SIMULATOR_URL` to the download
 URL for the v26.0 simulator archive used by `docker-javacard`. The job builds
-the Docker environment from a pinned commit, installs the CAP, and runs
-`hello.gpshell`. The test explicitly checks the final response for
-`48656C6C6F9000` (Hello and success). Its download is checksum-verified.
+the Docker environment from a pinned commit, installs both applet instances
+(`gp --install --applet` + `gp --create`, see the smoke test section) and runs
+`simulator/OracleSimulatorSmokeTest.java`. The test explicitly checks the final
+response for `48656C6C6F9000` (Hello and success).
+The simulator download is checksum-verified.
 
 # License
 
