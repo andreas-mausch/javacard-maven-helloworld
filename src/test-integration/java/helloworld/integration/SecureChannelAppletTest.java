@@ -1,6 +1,7 @@
 package helloworld.integration;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.licel.jcardsim.bouncycastle.util.encoders.Hex;
 import com.licel.jcardsim.smartcardio.CardSimulator;
@@ -25,109 +26,190 @@ public class SecureChannelAppletTest {
   private static final int SW_OK = 0x9000;
   private static final int SW_SECURITY_NOT_SATISFIED = 0x6982;
 
-  private static CardSimulator simulator;
+  private static final byte SUITE_GCM = SecureChannelClient.SUITE_GCM;
+  private static final byte SUITE_CBC_HMAC = SecureChannelClient.SUITE_CBC_HMAC;
 
-  private byte[] secureAidBytes;
+  private static CardSimulator simulator;
+  private static byte[] secureAidBytes;
+  private static byte[] secureCbcAidBytes;
+
   private SecureChannelClient client;
 
   @BeforeAll
   static void beforeAll() throws IOException {
     simulator = new CardSimulator();
+    secureAidBytes = Hex.decode(SECURE_AID_HEX);
+    secureCbcAidBytes = variantAid(secureAidBytes, (byte) 1);
 
-    install(HELLO_AID_HEX, HelloWorldApplet.class);
-    install(SECURE_AID_HEX, SecureChannelApplet.class);
+    install(HELLO_AID_HEX, HelloWorldApplet.class, null);
+    install(secureAidBytes, SecureChannelApplet.class, SUITE_GCM);
+    install(secureCbcAidBytes, SecureChannelApplet.class, SUITE_CBC_HMAC);
+  }
+
+  /**
+   * Installs with a full GP INSTALL data block: {@code [aidLen][aid]
+   * [capsLen][caps][dataLen][suite]}. A null suite installs without private
+   * data (used for HelloWorld, which ignores it).
+   */
+  private static void install(byte[] aidBytes,
+      Class<? extends javacard.framework.Applet> appletClass, Byte suite) {
+    AID aid = AIDUtil.create(aidBytes);
+    try {
+      ByteArrayOutputStream bos = new ByteArrayOutputStream();
+      bos.write(aidBytes.length);
+      bos.write(aidBytes);
+      bos.write(0x01); // card capabilities: one byte
+      bos.write(0x00);
+      bos.write(suite == null ? 0x00 : 0x01);
+      if (suite != null) {
+        bos.write(suite);
+      }
+      simulator.installApplet(aid, appletClass, bos.toByteArray(), (short) 0,
+          (byte) bos.size());
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private static void install(String aidHex,
-      Class<? extends javacard.framework.Applet> appletClass)
-      throws IOException {
-    byte[] aidBytes = Hex.decode(aidHex);
-    AID aid = AIDUtil.create(aidBytes);
-    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-    bos.write(aidBytes.length);
-    bos.write(aidBytes);
-    simulator.installApplet(aid, appletClass, bos.toByteArray(), (short) 0,
-        (byte) bos.size());
-    bos.close();
+      Class<? extends javacard.framework.Applet> appletClass, Byte suite) {
+    install(Hex.decode(aidHex), appletClass, suite);
+  }
+
+  private static byte[] variantAid(byte[] base, byte delta) {
+    byte[] b = base.clone();
+    b[b.length - 1] = (byte) (b[b.length - 1] + delta);
+    return b;
+  }
+
+  private SecureChannelClient clientFor(byte[] aid, byte suite) {
+    SecureChannelClient c = new SecureChannelClient(simulator, aid, suite);
+    c.select();
+    return c;
   }
 
   @BeforeEach
   void beforeEach() {
     simulator.reset();
-    secureAidBytes = Hex.decode(SECURE_AID_HEX);
-    client = new SecureChannelClient(simulator, secureAidBytes);
-    client.select();
+    client = clientFor(secureAidBytes, SUITE_GCM);
+  }
+
+  // --- core scenarios, run for BOTH cipher suites ---------------------------
+
+  @Test
+  public void testHandshakeAndSecretPingGcm() throws Exception {
+    runHandshakeAndPing(clientFor(secureAidBytes, SUITE_GCM));
   }
 
   @Test
-  public void testHandshakeAndSecretPing() throws Exception {
-    client.handshake();
-
-    byte[] message = "grüße, karte!".getBytes("UTF-8");
-    CommandAPDU cmd = client.protect(SecureChannelClient.INS_SECRET_PING,
-        message);
-    ResponseAPDU resp = client.transmit(cmd);
-    assertThat(resp.getSW()).isEqualTo(SW_OK);
-    assertThat(client.open(SecureChannelClient.INS_SECRET_PING, resp))
-        .isEqualTo(message);
+  public void testHandshakeAndSecretPingCbcHmac() throws Exception {
+    runHandshakeAndPing(clientFor(secureCbcAidBytes, SUITE_CBC_HMAC));
   }
 
-  @Test
-  public void testMultipleCommandsInSession() throws Exception {
-    client.handshake();
+  private void runHandshakeAndPing(SecureChannelClient c) throws Exception {
+    c.handshake();
     for (int i = 0; i < 5; i++) {
       byte[] message = ("msg-" + i).getBytes();
-      CommandAPDU cmd = client.protect(SecureChannelClient.INS_SECRET_PING,
-          message);
-      ResponseAPDU resp = client.transmit(cmd);
+      CommandAPDU cmd = c.protect(SecureChannelClient.INS_SECRET_PING, message);
+      ResponseAPDU resp = c.transmit(cmd);
       assertThat(resp.getSW()).isEqualTo(SW_OK);
-      assertThat(client.open(SecureChannelClient.INS_SECRET_PING, resp))
+      assertThat(c.open(SecureChannelClient.INS_SECRET_PING, resp))
           .isEqualTo(message);
     }
   }
 
   @Test
-  public void testProtectedCommandRejectedWithoutHandshake() {
-    // Without a handshake there is no session key, so any well-shaped but
-    // random payload must be rejected outright.
-    ResponseAPDU resp = client.transmit(new CommandAPDU(0x80,
-        SecureChannelClient.INS_SECRET_PING, 0, 0, new byte[28]));
-    assertThat(resp.getSW()).isEqualTo(SW_SECURITY_NOT_SATISFIED);
+  public void testTamperedCommandWipesSessionGcm() throws Exception {
+    runTamperWipes(clientFor(secureAidBytes, SUITE_GCM));
   }
 
   @Test
-  public void testTamperedCommandWipesSession() throws Exception {
-    client.handshake();
+  public void testTamperedCommandWipesSessionCbcHmac() throws Exception {
+    runTamperWipes(clientFor(secureCbcAidBytes, SUITE_CBC_HMAC));
+  }
 
-    CommandAPDU cmd = client.protect(SecureChannelClient.INS_SECRET_PING,
+  private void runTamperWipes(SecureChannelClient c) throws Exception {
+    c.handshake();
+    CommandAPDU cmd = c.protect(SecureChannelClient.INS_SECRET_PING,
         "original".getBytes());
     byte[] tampered = cmd.getBytes().clone();
     tampered[tampered.length - 3] ^= 0x01; // flip one ciphertext byte
-    assertThat(client.transmit(new CommandAPDU(tampered)).getSW())
+    assertThat(c.transmit(new CommandAPDU(tampered)).getSW())
         .isEqualTo(SW_SECURITY_NOT_SATISFIED);
 
     // Session must be dead: even the untouched command is rejected now.
-    assertThat(client.transmit(cmd).getSW())
-        .isEqualTo(SW_SECURITY_NOT_SATISFIED);
+    assertThat(c.transmit(cmd).getSW()).isEqualTo(SW_SECURITY_NOT_SATISFIED);
 
-    // ... until a fresh handshake.
-    client.handshake();
-    CommandAPDU fresh = client.protect(SecureChannelClient.INS_SECRET_PING,
+    c.handshake();
+    CommandAPDU fresh = c.protect(SecureChannelClient.INS_SECRET_PING,
         "again".getBytes());
-    assertThat(client.transmit(fresh).getSW()).isEqualTo(SW_OK);
+    assertThat(c.transmit(fresh).getSW()).isEqualTo(SW_OK);
   }
 
   @Test
-  public void testReplayIsRejected() throws Exception {
-    client.handshake();
+  public void testReplayRejectedGcm() throws Exception {
+    runReplayRejected(clientFor(secureAidBytes, SUITE_GCM));
+  }
 
-    CommandAPDU cmd = client.protect(SecureChannelClient.INS_SECRET_PING,
+  @Test
+  public void testReplayRejectedCbcHmac() throws Exception {
+    runReplayRejected(clientFor(secureCbcAidBytes, SUITE_CBC_HMAC));
+  }
+
+  private void runReplayRejected(SecureChannelClient c) throws Exception {
+    c.handshake();
+    CommandAPDU cmd = c.protect(SecureChannelClient.INS_SECRET_PING,
         "once".getBytes());
-    assertThat(client.transmit(cmd).getSW()).isEqualTo(SW_OK);
+    assertThat(c.transmit(cmd).getSW()).isEqualTo(SW_OK);
+    assertThat(c.transmit(cmd).getSW()).isEqualTo(SW_SECURITY_NOT_SATISFIED);
+  }
 
-    // Replay of the exact same APDU (same sequence number).
-    assertThat(client.transmit(cmd).getSW())
-        .isEqualTo(SW_SECURITY_NOT_SATISFIED);
+  // --- suite selection & install-parameter enforcement ----------------------
+
+  @Test
+  public void testInitEchoesMatchingSuiteByte() throws Exception {
+    ResponseAPDU gcmInit = client.transmit(
+        new CommandAPDU(0x80, 0x10, 0, 0, 255));
+    assertThat(gcmInit.getSW()).isEqualTo(SW_OK);
+    assertThat(gcmInit.getData()[gcmInit.getData().length - 1])
+        .isEqualTo(SUITE_GCM);
+
+    SecureChannelClient cbc = clientFor(secureCbcAidBytes, SUITE_CBC_HMAC);
+    ResponseAPDU cbcInit = cbc.transmit(
+        new CommandAPDU(0x80, 0x10, 0, 0, 255));
+    assertThat(cbcInit.getData()[cbcInit.getData().length - 1])
+        .isEqualTo(SUITE_CBC_HMAC);
+  }
+
+  @Test
+  public void testClientRefusesSuiteMismatch() throws Exception {
+    // A CBC client pointed at the GCM instance must abort during handshake
+    // (INIT echoes suite 01, the client expected 02).
+    SecureChannelClient mismatch = clientFor(secureAidBytes, SUITE_CBC_HMAC);
+    assertThatThrownBy(mismatch::handshake).isInstanceOf(AssertionError.class);
+  }
+
+  @Test
+  public void testInstallRejectsMissingSuiteParam() {
+    byte[] aid = variantAid(secureAidBytes, (byte) 7);
+    assertThatThrownBy(() -> install(aid, SecureChannelApplet.class, null))
+        .isInstanceOf(Throwable.class);
+  }
+
+  @Test
+  public void testInstallRejectsUnknownSuite() {
+    byte[] aid = variantAid(secureAidBytes, (byte) 8);
+    assertThatThrownBy(() -> install(aid, SecureChannelApplet.class, (byte) 0x03))
+        .isInstanceOf(Throwable.class);
+  }
+
+  // --- runtime behaviours that only exist on one instance -------------------
+
+  @Test
+  public void testProtectedCommandRejectedWithoutHandshake() {
+    ResponseAPDU resp = client.transmit(new CommandAPDU(0x80,
+        SecureChannelClient.INS_SECRET_PING, 0, 0, new byte[28]));
+    assertThat(resp.getSW()).isEqualTo(SW_SECURITY_NOT_SATISFIED);
   }
 
   @Test
@@ -137,13 +219,10 @@ public class SecureChannelAppletTest {
         "before".getBytes());
     assertThat(client.transmit(cmd).getSW()).isEqualTo(SW_OK);
 
-    // Select the other applet: triggers deselect of the secure applet.
     simulator.selectApplet(AIDUtil.create(Hex.decode(HELLO_AID_HEX)));
     client.select();
 
-    // Old session data (prefix/seq state) is gone -> rejected.
-    assertThat(client.transmit(cmd).getSW())
-        .isEqualTo(SW_SECURITY_NOT_SATISFIED);
+    assertThat(client.transmit(cmd).getSW()).isEqualTo(SW_SECURITY_NOT_SATISFIED);
 
     client.handshake();
     CommandAPDU fresh = client.protect(SecureChannelClient.INS_SECRET_PING,
@@ -153,33 +232,27 @@ public class SecureChannelAppletTest {
 
   @Test
   public void testNewInitInvalidatesPendingExchange() throws Exception {
-    // INIT once and build the matching EXCHANGE, but do not send it yet.
-    ResponseAPDU init = client.transmit(
-        new CommandAPDU(0x80, 0x10, 0, 0, 255));
+    ResponseAPDU init = client.transmit(new CommandAPDU(0x80, 0x10, 0, 0, 255));
     assertThat(init.getSW()).isEqualTo(SW_OK);
     byte[] body = client.startExchange(init.getData());
 
-    // A fresh INIT rotates the card's ephemeral key and nonce.
     assertThat(client.transmit(new CommandAPDU(0x80, 0x10, 0, 0, 255)).getSW())
         .isEqualTo(SW_OK);
 
-    // The pending EXCHANGE is bound to the rotated transcript -> rejected.
     assertThat(client.transmit(new CommandAPDU(0x80, 0x12, 0, 0, body)).getSW())
         .isEqualTo(SW_SECURITY_NOT_SATISFIED);
   }
 
   @Test
   public void testWrongCla() {
-    ResponseAPDU resp = client.transmit(
-        new CommandAPDU(0x00, 0x10, 0, 0, 0));
+    ResponseAPDU resp = client.transmit(new CommandAPDU(0x00, 0x10, 0, 0, 0));
     assertThat(resp.getSW()).isEqualTo(0x6E00);
   }
 
   @Test
   public void testHelloWorldUnaffectedInSameSimulator() {
     simulator.selectApplet(AIDUtil.create(Hex.decode(HELLO_AID_HEX)));
-    ResponseAPDU resp = client.transmit(
-        new CommandAPDU(0x80, 0x00, 0, 0));
+    ResponseAPDU resp = client.transmit(new CommandAPDU(0x80, 0x00, 0, 0));
     assertThat(resp.getSW()).isEqualTo(SW_OK);
     assertThat(resp.getData()).isEqualTo("Hello".getBytes());
   }
