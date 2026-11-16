@@ -103,6 +103,47 @@ public class SecureChannelApplet extends Applet {
   /** Known plaintext of the confirmation tokens (all zeros, length 16). */
   private static final byte[] CONF_PT = new byte[TOKEN_PT_LEN];
 
+  // --- Install-time capability self test ------------------------------------
+  // install() probes every primitive this applet needs so that a card
+  // lacking one fails the GP INSTALL with a vendor SW of the form
+  // 0x9F00 | bitmask (see bits below) instead of a generic error from deep
+  // inside the constructor. Note: probe() runs before register(), so nothing
+  // is registered on failure; see README for the SW table.
+
+  /** Vendor SW base for a failed capability self test. */
+  private static final short SW_MISSING_ALGORITHMS = (short) 0x9F00;
+
+  // Missing-primitive bitmask (combine freely; multiple bits may be set).
+  private static final short MISS_SHA256 = 0x0001; // MessageDigest
+  private static final short MISS_RANDOM = 0x0002; // RandomData
+  private static final short MISS_EC_FP_256 = 0x0004; // EC FP-256 keypair
+  private static final short MISS_ECDH_PLAIN = 0x0008; // ALG_EC_SVDP_DH_PLAIN
+  private static final short MISS_AES_TRANSIENT = 0x0010; // AES *_TRANSIENT_DESELECT
+  private static final short MISS_GCM = 0x0020; // AEADCipher ALG_AES_GCM
+  private static final short MISS_GCM_KAT = 0x0040; // GCM round trip broken
+
+  // Throwaway inputs for the GCM known-answer smoke test.
+  private static final byte[] KAT_KEY = {
+      (byte) 0x00, (byte) 0x01, (byte) 0x02, (byte) 0x03, (byte) 0x04, (byte) 0x05,
+      (byte) 0x06, (byte) 0x07, (byte) 0x08, (byte) 0x09, (byte) 0x0A, (byte) 0x0B,
+      (byte) 0x0C, (byte) 0x0D, (byte) 0x0E, (byte) 0x0F, (byte) 0x10, (byte) 0x11,
+      (byte) 0x12, (byte) 0x13, (byte) 0x14, (byte) 0x15, (byte) 0x16, (byte) 0x17,
+      (byte) 0x18, (byte) 0x19, (byte) 0x1A, (byte) 0x1B, (byte) 0x1C, (byte) 0x1D,
+      (byte) 0x1E, (byte) 0x1F
+  };
+  private static final byte[] KAT_PT = {
+      'S', 'C', 'v', '1', 'k', 'a', 't', '!', 0, 0, 0, 0, 0, 0, 0, 0
+  };
+  private static final byte[] KAT_AAD = {'S', 'C', 'v', '1', 'k', 'a', 't'};
+
+  /** Layout of the 96-byte probe workspace. */
+  private static final short KAT_IV = 0; // 12
+  private static final short KAT_CT = 12; // 16
+  private static final short KAT_TAG = 28; // 16
+  private static final short KAT_PT_OFF = 44; // 16
+  private static final short KAT_AAD_OFF = 64; // 7
+  private static final short KAT_OUT = 76; // 16
+
   // --- NIST P-256 (secp256r1) domain parameters --------------------------
 
   private static final byte[] EC_P = {
@@ -181,9 +222,117 @@ public class SecureChannelApplet extends Applet {
 
   // ------------------------------------------------------------------------
 
+  /**
+   * Fails with SW_MISSING_ALGORITHMS | bitmask if the card lacks a required
+   * primitive, so a broken deployment never registers a half-usable applet.
+   */
   public static void install(byte[] bArray, short bOffset, byte bLength) {
+    short missing = probe();
+    if (missing != 0) {
+      ISOException.throwIt((short) (SW_MISSING_ALGORITHMS | missing));
+    }
     new SecureChannelApplet().register(bArray, (short) (bOffset + 1),
         bArray[bOffset]);
+  }
+
+  /**
+   * Checks that all primitives used by this applet are available and that
+   * AES-GCM works (round trip + tamper rejection via the same openGcm code
+   * path used at runtime). Availability probes only throw
+   * CryptoException(NO_SUCH_ALGORITHM), which is cheap and side-effect free;
+   * classic Java Card has no garbage collector, so probe() intentionally
+   * leaks only a handful of small key/cipher objects and one transient
+   * buffer — the price of failing install early with a good SW.
+   *
+   * @return bitmask of missing primitives, 0 if the card is fully capable
+   */
+  private static short probe() {
+    short missing = 0;
+
+    try {
+      MessageDigest.getInstance(MessageDigest.ALG_SHA_256, false);
+    } catch (CryptoException e) {
+      missing |= MISS_SHA256;
+    }
+    try {
+      RandomData.getInstance(RandomData.ALG_SECURE_RANDOM);
+    } catch (CryptoException e) {
+      missing |= MISS_RANDOM;
+    }
+    try {
+      KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PRIVATE,
+          KeyBuilder.LENGTH_EC_FP_256, false);
+      KeyBuilder.buildKey(KeyBuilder.TYPE_EC_FP_PUBLIC,
+          KeyBuilder.LENGTH_EC_FP_256, false);
+    } catch (CryptoException e) {
+      missing |= MISS_EC_FP_256;
+    }
+    try {
+      KeyAgreement.getInstance(KeyAgreement.ALG_EC_SVDP_DH_PLAIN, false);
+    } catch (CryptoException e) {
+      missing |= MISS_ECDH_PLAIN;
+    }
+    try {
+      KeyBuilder.buildKey(KeyBuilder.TYPE_AES_TRANSIENT_DESELECT,
+          KeyBuilder.LENGTH_AES_256, false);
+      KeyBuilder.buildKey(KeyBuilder.TYPE_AES_TRANSIENT_DESELECT,
+          KeyBuilder.LENGTH_AES_128, false);
+    } catch (CryptoException e) {
+      missing |= MISS_AES_TRANSIENT;
+    }
+
+    AEADCipher cipher = null;
+    try {
+      cipher = (AEADCipher) Cipher.getInstance(AEADCipher.ALG_AES_GCM, false);
+    } catch (CryptoException e) {
+      missing |= MISS_GCM;
+    }
+    if (cipher != null && !probeGcm(cipher)) {
+      missing |= MISS_GCM_KAT;
+    }
+    return missing;
+  }
+
+  /**
+   * GCM smoke test on a throwaway key: seal a known plaintext, open it back
+   * (must match), then flip one ciphertext byte and open again — the tag
+   * check must reject it. Detects runtimes that advertise ALG_AES_GCM but
+   * implement it inconsistently (our gcmOpen()/openGcm() portability dance
+   * included, this is the exact path the session will take).
+   */
+  private static boolean probeGcm(AEADCipher cipher) {
+    byte[] ws = JCSystem.makeTransientByteArray((short) 96,
+        JCSystem.CLEAR_ON_RESET);
+    try {
+      AESKey key = (AESKey) KeyBuilder.buildKey(KeyBuilder.TYPE_AES,
+          KeyBuilder.LENGTH_AES_256, false);
+      key.setKey(KAT_KEY, (short) 0);
+      Util.arrayCopyNonAtomic(KAT_PT, (short) 0, ws, KAT_PT_OFF, TOKEN_PT_LEN);
+      Util.arrayCopyNonAtomic(KAT_AAD, (short) 0, ws, KAT_AAD_OFF,
+          (short) KAT_AAD.length);
+
+      cipher.init(key, Cipher.MODE_ENCRYPT, ws, KAT_IV, IV_LEN);
+      cipher.updateAAD(ws, KAT_AAD_OFF, (short) KAT_AAD.length);
+      cipher.doFinal(ws, KAT_PT_OFF, TOKEN_PT_LEN, ws, KAT_CT);
+      cipher.retrieveTag(ws, KAT_TAG, TAG_LEN);
+
+      // Open must return the known plaintext.
+      boolean ok = openGcm(cipher, key, ws, KAT_AAD_OFF,
+          (short) KAT_AAD.length, ws, KAT_IV, KAT_CT, TOKEN_PT_LEN, ws,
+          KAT_OUT)
+          && Util.arrayCompare(ws, KAT_OUT, KAT_PT, (short) 0, TOKEN_PT_LEN) == 0;
+
+      // A flipped ciphertext byte must be rejected by the tag check.
+      ws[KAT_CT] ^= 1;
+      boolean rejected = !openGcm(cipher, key, ws, KAT_AAD_OFF,
+          (short) KAT_AAD.length, ws, KAT_IV, KAT_CT, TOKEN_PT_LEN, ws,
+          KAT_OUT);
+
+      key.clearKey();
+      return ok && rejected;
+    } catch (CryptoException e) {
+      return false;
+    }
   }
 
   private SecureChannelApplet() {
@@ -466,20 +615,33 @@ public class SecureChannelApplet extends Applet {
    */
   private boolean gcmOpen(AESKey key, byte[] aadBuf, short aadOff,
       short aadLen, byte[] in, short ivOff, short ctOff, short ctLen) {
+    return openGcm(gcm, key, aadBuf, aadOff, aadLen, in, ivOff, ctOff, ctLen,
+        decBuf, (short) 0);
+  }
+
+  /**
+   * Static core of {@link #gcmOpen} so the install-time probe can run the
+   * exact same code path. Plaintext lands in out[outOff..outOff+ctLen);
+   * that region must not overlap iv/ct/tag in `in`.
+   */
+  private static boolean openGcm(AEADCipher cipher, AESKey key,
+      byte[] aadBuf, short aadOff, short aadLen, byte[] in, short ivOff,
+      short ctOff, short ctLen, byte[] out, short outOff) {
     short tagOff = (short) (ctOff + ctLen);
     try {
       // Spec form: doFinal(ct) -> pt, then verifyTag(wire tag).
-      gcm.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
-      gcm.updateAAD(aadBuf, aadOff, aadLen);
-      short dlen = gcm.doFinal(in, ctOff, ctLen, decBuf, (short) 0);
-      return dlen == ctLen && gcm.verifyTag(in, tagOff, TAG_LEN, TAG_LEN);
+      cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
+      cipher.updateAAD(aadBuf, aadOff, aadLen);
+      short dlen = cipher.doFinal(in, ctOff, ctLen, out, outOff);
+      return dlen == ctLen
+          && cipher.verifyTag(in, tagOff, TAG_LEN, TAG_LEN);
     } catch (CryptoException specMismatch) {
       try {
         // jcardsim/BC form: doFinal(ct || tag), tag verified internally.
-        gcm.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
-        gcm.updateAAD(aadBuf, aadOff, aadLen);
-        short dlen = gcm.doFinal(in, ctOff, (short) (ctLen + TAG_LEN), decBuf,
-            (short) 0);
+        cipher.init(key, Cipher.MODE_DECRYPT, in, ivOff, IV_LEN);
+        cipher.updateAAD(aadBuf, aadOff, aadLen);
+        short dlen = cipher.doFinal(in, ctOff, (short) (ctLen + TAG_LEN), out,
+            outOff);
         return dlen == ctLen;
       } catch (CryptoException bcMismatch) {
         return false;
