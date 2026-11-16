@@ -106,6 +106,34 @@ AAD/IV scheme from `secretPing()` (or lift its open/seal parts into helpers)
 for each instruction you want to guard. Non-protected instructions (like
 `INIT`/`EXCHANGE`) stay open by design.
 
+## Install-time capability self test
+
+`Applet.install` probes every primitive this applet needs **before**
+`register()`, so a card that lacks one fails the GP INSTALL instead of
+registering a half-usable applet. The applet throws `ISOException` with a
+vendor status word `0x9F00 | bitmask` of missing pieces:
+
+| Bit | Missing primitive |
+|---|---|
+| `0x01` | `MessageDigest` SHA-256 |
+| `0x02` | `RandomData` secure random |
+| `0x04` | EC FP 256-bit keys |
+| `0x08` | `KeyAgreement` `ALG_EC_SVDP_DH_PLAIN` |
+| `0x10` | AES `*_TRANSIENT_DESELECT` keys (128 + 256) |
+| `0x20` | `AEADCipher` `ALG_AES_GCM` |
+| `0x40` | GCM functional test failed |
+
+The functional GCM test (`0x40`) seals a known plaintext, opens it back
+through the same `gcmOpen()` code path the session later uses and verifies
+that a flipped ciphertext byte is rejected — runtimes that advertise GCM but
+implement it inconsistently fail at install, too.
+
+How the failure surfaces is runtime-dependent: on the Oracle simulator v26
+the GP tool reports the generic `INSTALL … failed: 0x6A80` while
+`/var/log/jcsl.log` shows the exact reason
+(`ISOException (reason=0x9F04)` = EC FP-256 keys missing). On real hardware
+the SW mapping depends on the card runtime and loader.
+
 ## Limitations (read before production use!)
 
 - **No entity authentication.** Both ECDH keys are ephemeral, so an active
