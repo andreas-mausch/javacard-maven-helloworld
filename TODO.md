@@ -1,0 +1,3 @@
+- zertifikat auf der javacard speichern, damit die echtheit bestätigt werden kann
+- warum haben wir die ganzen konstanten im repo? ich dachte die javacard kann den algo direkt
+- werden session keys auf der javacard persistiert? wünschenswert wäre, dass sie nur im RAM gespeichert sind. oder?
