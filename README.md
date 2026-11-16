@@ -40,7 +40,7 @@ JavaCard distinguishes three AIDs. In this project they are:
 | Package AID | `0102030405` | Derived from the first 5 bytes of `<applet.id>`; exposed as the `${package.id}` property |
 | Applet AID | `010203040506` | Your `<applet.id>`; stored in the CAP's applet component |
 | Instance AID | `010203040506` | Assigned at install time; a default `gp --install` (and jCardSim's `installApplet`) uses the applet AID |
-| Second applet | `010203040507` | `<applet.id.secure>` — `SecureChannelApplet`, same package and CAP (see "Secure channel applet") |
+| Second applet | `010203040507` | `<applet.id.secure>` — `SecureChannelApplet`, same package and CAP (see "Secure channel applet"). Instances: `0507` = suite 01 (GCM), `0508` = suite 02 (CBC+HMAC) |
 
 `SELECT` always targets the *instance* AID — `010203040506` here:
 
@@ -55,45 +55,81 @@ Integration tests receive all values as system properties injected by the parent
 See [AIDs](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.5.0/README-javacard.md#aids)
 for the background on all three.
 
-# Secure channel applet (ECDH + HKDF + AES-256-GCM)
+# Secure channel applet (ECDH + HKDF, GCM or CBC+HMAC)
 
-`helloworld.SecureChannelApplet` (instance AID `010203040507`, same CAP as
+`helloworld.SecureChannelApplet` (applet AID `010203040507`, same CAP as
 `HelloWorldApplet`) establishes an encrypted, integrity-protected application
 channel between a phone app and the card — applet-level, independent of the
 GlobalPlatform SCP02 management channel.
 
+## Cipher suites — chosen by the install parameter, no fallback
+
+The GP INSTALL private data must be **exactly one byte** selecting the cipher
+suite for that *instance*:
+
+| Param | Suite |
+|---|---|
+| `0x01` | AES-256-GCM (`AEADCipher.ALG_AES_GCM`) |
+| `0x02` | AES-256-CBC (ISO9797-M2 padding) + HMAC-SHA-256, Encrypt-then-MAC, tag truncated to 16 B |
+
+There is deliberately **no default and no runtime fallback**: a missing
+parameter fails the install with `0x9E01`, an unknown byte with `0x9E02`, and
+a card that cannot run the chosen suite fails with the `0x9F00 | bitmask`
+below. That way an instance can never silently drop to a weaker algorithm:
+
+```bash
+gp --create 010203040507 --package 0102030405 --applet 010203040507 --params 01
+gp --create 010203040508 --package 0102030405 --applet 010203040507 --params 02
+```
+
+(`--applet` always names the applet *class* AID from the CAP; the first
+argument of `--create` is the new *instance* AID. Both instances above can
+coexist on one card — the suite byte is part of the handshake transcript, so
+keys, tokens and ciphertexts of the two suites can never be confused.)
+
 ## Protocol v1
 
 All commands use `CLA = 0x80`. Curve is secp256r1 (`P-256`), domain parameters
-pinned in the applet.
+pinned in the applet. Widths `(a/b)` are suite 01/02; the wire format is
+otherwise identical (`iv || ct || tag`, tag always 16 B).
 
 | INS | Name | Direction | Payload |
 |---|---|---|---|
 | `0x10` | INIT | → card | — |
-| | | ← card | `Q_card (65B) \|\| N_card (16B)` |
-| `0x12` | EXCHANGE | → card | `Q_peer (65B) \|\| N_peer (16B) \|\| iv (12B) \|\| ct (16B) \|\| tag (16B)` |
-| | | ← card | `iv (12B) \|\| ct (16B) \|\| tag (16B)` |
-| `0xB0` | SECRET_PING | → card | `iv (12B) \|\| ct \|\| tag (16B)` (echo demo for protected commands) |
+| | | ← card | `Q_card (65B) \|\| N_card (16B) \|\| suite (1B)` |
+| `0x12` | EXCHANGE | → card | `Q_peer (65B) \|\| N_peer (16B) \|\| iv (12/16B) \|\| ct (16/32B) \|\| tag (16B)` |
+| | | ← card | `iv (12/16B) \|\| ct (16/32B) \|\| tag (16B)` |
+| `0xB0` | SECRET_PING | → card | `iv (12/16B) \|\| ct \|\| tag (16B)` (echo demo for protected commands) |
 
-Key derivation after both nonces are known:
+Key derivation after both nonces are known (`SCvN`, N = suite number):
 
 ```
 Z      = ECDH(d_card, Q_peer)                    (KeyAgreement ALG_EC_SVDP_DH_PLAIN)
 salt   = N_card || N_peer
 PRK    = HKDF-Extract(salt, Z)                   (HMAC-SHA-256)
-K_conf = HKDF-Expand(PRK, "SCv1-conf")[0..16)    AES-128, handshake tokens only
-K_msg  = HKDF-Expand(PRK, "SCv1-msg")[0..32)     AES-256, session messages
+K_conf = HKDF-Expand(PRK, "SCvN-conf")[0..16)    AES-128, handshake tokens only
+K_msg  = HKDF-Expand(PRK, "SCvN-msg")[0..32)     AES-256, session messages
+# suite 02 only, raw transient byte[] (HMAC needs raw keys, see limitations):
+K_confmac = HKDF-Expand(PRK, "SCv2-confmac")     32B, handshake token MAC
+K_mac     = HKDF-Expand(PRK, "SCv2-mac")         32B, session message MAC
 ```
 
-EXCHANGE carries a key-confirmation token — AES-GCM under `K_conf` over the
-transcript `Q_card || Q_peer || N_card || N_peer || dir` as AAD — and the card
-answers with its own token (direction byte flipped). On success the session is
-active; the keys live in transient `AESKey` objects.
+EXCHANGE carries a key-confirmation token — sealed under `K_conf` (suite 02:
+plus `K_confmac`) and bound to the transcript
+`Q_card || Q_peer || N_card || N_peer || suite || dir` (as GCM AAD, or as MAC
+input prefix `transcript || iv || ct` for suite 02) — and the card answers
+with its own token (direction byte flipped). On success the session is
+active; the keys live in transient `AESKey` objects / transient arrays.
 
-Protected commands use `K_msg`. The 12-byte IV is `prefix (4B) || seq (8B,
-big-endian, strictly increasing)` with per-direction prefixes taken from the
-session nonces; the IV and the APDU header are bound into the GCM AAD, which
-gives replay and reordering protection. `0x6982
+Protected commands use `K_msg` (suite 02 also `K_mac`). The IV is
+`prefix (4B) || seq (8B, big-endian, strictly increasing)` (+ four zero bytes
+to fill the 16 B CBC IV), with per-direction prefixes taken from the session
+nonces. Suite 01 binds IV and APDU header via the GCM AAD
+(`CLA||INS||P1||P2||Lc||iv`, responses `INS||iv`); suite 02 via the MAC input
+(`CLA..Lc||iv||ct`, responses `INS||iv||ct`). Both give replay and reordering
+protection. Suite 02 is strict **Encrypt-then-MAC**: the truncated HMAC is
+verified (constant-time `Util.arrayCompare`) *before* anything decrypts, so a
+forged message never reaches the padding parser. `0x6982
 SECURITY_STATUS_NOT_SATISFIED` is returned when: no session is active, a
 command arrives without/before its sequence, or integrity fails. **Any
 integrity failure wipes the session** — the phone must redo INIT/EXCHANGE.
@@ -108,10 +144,16 @@ for each instruction you want to guard. Non-protected instructions (like
 
 ## Install-time capability self test
 
-`Applet.install` probes every primitive this applet needs **before**
-`register()`, so a card that lacks one fails the GP INSTALL instead of
-registering a half-usable applet. The applet throws `ISOException` with a
-vendor status word `0x9F00 | bitmask` of missing pieces:
+`Applet.install` parses the suite parameter and probes every primitive the
+**chosen suite** needs **before** `register()`, so a card that lacks one fails
+the GP INSTALL instead of registering a half-usable applet. The applet throws
+`ISOException` with a vendor status word:
+
+| SW | Meaning |
+|---|---|
+| `0x9E01` | INSTALL data carries no (or not exactly one) suite byte |
+| `0x9E02` | Suite byte is neither `0x01` nor `0x02` |
+| `0x9F00 \| bitmask` | Card lacks primitives of the chosen suite (table below) |
 
 | Bit | Missing primitive |
 |---|---|
@@ -120,19 +162,20 @@ vendor status word `0x9F00 | bitmask` of missing pieces:
 | `0x04` | EC FP 256-bit keys |
 | `0x08` | `KeyAgreement` `ALG_EC_SVDP_DH_PLAIN` |
 | `0x10` | AES `*_TRANSIENT_DESELECT` keys (128 + 256) |
-| `0x20` | `AEADCipher` `ALG_AES_GCM` |
-| `0x40` | GCM functional test failed |
+| `0x20` | Suite cipher unavailable (`ALG_AES_GCM` / `ALG_AES_CBC_ISO9797_M2`) |
+| `0x40` | Suite cipher functional test failed |
 
-The functional GCM test (`0x40`) seals a known plaintext, opens it back
-through the same `gcmOpen()` code path the session later uses and verifies
-that a flipped ciphertext byte is rejected — runtimes that advertise GCM but
-implement it inconsistently fail at install, too.
+The functional test (`0x40`) seals a known plaintext and opens it back
+through the *same* `gcmOpen()`/`sealCbcHmac()+openCbcHmac()` code paths the
+session later uses, and verifies that a flipped byte is rejected — runtimes
+that advertise a cipher but implement it inconsistently fail at install, too.
 
 How the failure surfaces is runtime-dependent: on the Oracle simulator v26
 the GP tool reports the generic `INSTALL … failed: 0x6A80` while
 `/var/log/jcsl.log` shows the exact reason
-(`ISOException (reason=0x9F04)` = EC FP-256 keys missing). On real hardware
-the SW mapping depends on the card runtime and loader.
+(`ISOException (reason=0x9F04)` = EC FP-256 keys missing). A real card
+(SLE99-class, see below) propagated the vendor SW `0x9F20` verbatim through
+`gp --create`.
 
 ## Limitations (read before production use!)
 
@@ -140,9 +183,12 @@ the SW mapping depends on the card runtime and loader.
   network attacker can run two handshakes (MITM). Mitigation options: pin a
   static card key and sign the handshake (`Signature ALG_ECDSA_SHA_256`), or
   provision per-card secrets out-of-band.
-- GCM support is optional in Java Card 3.0.5 — probe it on your target card,
-  e.g. with a tiny self-test INS calling
-  `AEADCipher.getInstance(AEADCipher.ALG_AES_GCM, false)`. The AEADCipher
+- GCM support is optional in Java Card 3.0.5 — and actually missing on some
+  otherwise capable cards (our test card reports everything green except bit
+  `0x20`, i.e. `AEADCipher`/`ALG_AES_GCM`, while SHA-256, EC P-256 ECDH and
+  AES itself are present). Suite `0x02` (CBC+HMAC, both of which the card
+  does have) exists exactly for such cards; prefer suite `0x01` where GCM
+  works. The AEADCipher
   *decrypt* contract also varies between runtimes: the spec (and the Oracle
   simulator / real cards) uses `doFinal(ciphertext)` -> plaintext followed by
   `verifyTag(wireTag)` -> boolean, while jCardSim implements the JCE/BC-style
@@ -157,7 +203,8 @@ the SW mapping depends on the card runtime and loader.
   reads it as *bits*, jCardSim as *bytes*, which rejects `setKey` of a 32-byte
   key), and the 4-arg `buildKey` variant with `ALG_TYPE_HMAC` is not supported
   there at all. The manual construction sidesteps this entirely (all keys here
-  are ≤ block size, so no long-key hashing path is needed).
+  are ≤ block size, so no long-key hashing path is needed) and, as a side
+  effect, suite 02 keeps its MAC keys as plain transient arrays.
 - `KeyPair.genKeyPair()` on INIT can take hundreds of ms on real silicon.
 
 ## Build plumbing for two applets in one CAP
@@ -222,8 +269,9 @@ command. This local configuration file is ignored by Git.
 `src/test-integration/java` in a package containing `.integration.`.
 Surefire excludes these tests; Failsafe runs them during `verify`.
 
-This example currently has twelve integration tests (three for Hello World,
-nine for the secure channel) and no separate unit tests.
+This example currently has eighteen integration tests (three for Hello World,
+fifteen for the secure channel, covering both cipher suites) and no separate
+unit tests.
 Results are written to `target/failsafe-reports/`, with an HTML report at
 `target/reports/tests-integration.html`. A warning about missing unit-test report
 input is expected because there are no unit tests.
@@ -233,10 +281,11 @@ input is expected because there are no unit tests.
 `simulator/OracleSimulatorSmokeTest.java` exercises the built CAP end-to-end on
 the real Oracle Java Card simulator (v26.0) inside a
 [docker-javacard](https://github.com/andreas-mausch/docker-javacard) container:
-selects both applets, runs a full handshake, protected round trips, replay and
-tamper rejection and checks that deselecting wipes the session. It is a
-dependency-free single-file program (`javax.smartcardio` + JCE) that is compiled
-inside the container:
+selects both applets, then runs the full scenario twice — once per suite
+instance (`0507`/GCM, `0508`/CBC-HMAC): handshake, protected round trips,
+replay and tamper rejection and checks that deselecting wipes the session. It
+is a dependency-free single-file program (`javax.smartcardio` + JCE, the
+ISO9797-M2 padding is done by hand) that is compiled inside the container:
 
 ```bash
 docker run --rm \
@@ -247,15 +296,20 @@ docker run --rm \
     gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }
     unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK
     gp --install ./helloworld.cap --applet 010203040506
-    gp --create 010203040507 --package 0102030405 --applet 010203040507
+    gp --create 010203040507 --package 0102030405 --applet 010203040507 --params 01
+    gp --create 010203040508 --package 0102030405 --applet 010203040507 --params 02
     javac -d /tmp/smoke /simulator/OracleSimulatorSmokeTest.java
     java -cp /tmp/smoke OracleSimulatorSmokeTest'
 ```
 
-Two notes on installing a CAP that contains two applets: `gp --install`
-refuses it without `--applet <AID>` (the AID, not the class name), and the
-second instance must be created with `gp --create` — a second `gp --install`
-tries to reload the package, which the simulator rejects with `0x6985`.
+Notes on installing this CAP: `gp --install` refuses a two-applet CAP without
+`--applet <AID>` (the AID, not the class name), additional instances are
+created with `gp --create` — a second `gp --install` tries to reload the
+package, which the simulator rejects with `0x6985` — and
+`--create <instance-aid> --applet <class-aid>` takes the class AID
+(`0507`) while the *instance* AID is free-form (`0508`). The `--params` byte
+selects the cipher suite (gp warns "did not parse as valid TLV" — fine, it
+then sends the raw bytes as applet private data).
 
 # Linting and formatting
 
@@ -417,11 +471,12 @@ its signatures are not trusted release signatures.
 The additional Oracle simulator job is opt-in: start the workflow manually with
 `run_simulator` enabled and set `ORACLE_JAVACARD_SIMULATOR_URL` to the download
 URL for the v26.0 simulator archive used by `docker-javacard`. The job builds
-the Docker environment from a pinned commit, installs both applet instances
-(`gp --install --applet` + `gp --create`, see the smoke test section) and runs
+the Docker environment from a pinned commit, installs a HelloWorld instance
+plus one secure-channel instance per cipher suite (`gp --install --applet` +
+two `gp --create --params` calls, see the smoke test section) and runs
 `simulator/OracleSimulatorSmokeTest.java`. The test explicitly checks the final
-response for `48656C6C6F9000` (Hello and success).
-The simulator download is checksum-verified.
+response for `48656C6C6F9000` (Hello and success). The simulator download is
+checksum-verified.
 
 # License
 
