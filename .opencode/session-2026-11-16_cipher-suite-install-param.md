@@ -9,7 +9,8 @@
   silently slide onto a "worse" algorithm unnoticed.
 - → **Achieved:** suite `01` = AES-256-GCM, suite `02` = AES-256-CBC
   (ISO9797-M2) + HMAC-SHA-256 Encrypt-then-MAC; five commits
-  (`51b070b`…`c385ecc`), 18/18 jCardSim + 31/31 Oracle simulator.
+  (`51b070b`…`c385ecc`), 18/18 jCardSim + 31/31 Oracle simulator —
+  and later the same day **verified on the real card** (see below).
 
 ## Preferences
 - Ask before git commit; never push (neonew pushes personally).
@@ -64,6 +65,19 @@
 - README: suites section, SW table (`0x9E01`/`0x9E02`, renamed bits),
   updated recipes. → `c385ecc`
 
+### Real-card verification (same day)
+- New CAP onto the physical card; `gp --create …0508 --params 02`
+  **succeeded** → `ALG_AES_CBC_ISO9797_M2` is present on the card and the
+  install-time probe + CBC-HMAC KAT passed on real silicon.
+- Fail-closed proof on hardware: `--params 01` failed with **`0x9F20`**
+  (no GCM), missing parameter failed with **`0x9E01`** — no silent
+  downgrade anywhere.
+- Smoke harness vs. the physical card: **17/17** (3 hello checks + full
+  suite-02 scenario: handshake with suite echo, ping loop, replay and
+  tamper rejection, session wipe, re-handshake). Suite-01 block skipped
+  cleanly (absent `…0507` selects with `6E00` → `SKIP`), proving the
+  one-suite-per-card workflow.
+
 ## Problems and solutions
 - **gp flag:** it's `--params <hex>` (checked via `gp --help`).
 - **`0x6A88` on `gp --create 010203040508 --applet 010203040508`:**
@@ -88,20 +102,19 @@
   input (worst-case short APDU) + 32 tail (inner digest + MAC output). The
   KAT wire buffer lives at the ws tail to never overlap pad||msg.
 - `Util.arrayCompare` is the constant-time compare (JC 3.0.5 requirement).
-- jCardSim `Cipher.ALG_AES_CBC_ISO9797_M2` works (BC-backed); real card's
-  support for M2 is **untested** — the probe will tell (bit 0x20/0x40).
+- jCardSim `Cipher.ALG_AES_CBC_ISO9797_M2` works (BC-backed); **verified on
+  the real card too** — the card's install probe accepted CBC-M2 and the
+  production seal/open path ran 17/17 green on hardware.
 - Smoke harness stays JDK-only: M2 padding by hand, `AES/CBC/NoPadding` +
   `Mac HmacSHA256` (no BouncyCastle inside the container).
 
 ## Next steps
-- neonew: rebuild + deploy to the **real card** with `--params 02`; expected:
-  install succeeds (or probe reports CBC missing with 0x9F20/0x9F40),
-  `--params 01` must keep failing `0x9F20` — proof the fail-closed design
-  holds on hardware.
-- Real-card command sequence (old CAP on card):
-  `gp --delete 010203040506` → `gp --delete --package 0102030405` →
-  `gp --install … --applet 010203040506` → `gp --create 010203040508
-  --package 0102030405 --applet 010203040507 --params 02`.
 - neonew pushes `spike/secure-channel`; PR/evaluation later.
+- Reference for re-deploying to a card carrying the old CAP:
+  `gp --delete 010203040506` → `gp --delete 0102030405` (v25.10.20:
+  `--delete` takes applet AND package AIDs directly, `--package` is only
+  for `--create`/`--install`) → `gp --install 010203040506.cap
+  --applet 010203040506` → `gp --create 010203040508 --package
+  0102030405 --applet 010203040507 --params 02`.
 - Open follow-ups live in `.opencode/TODOs.md` (card authentication/MITM,
   chaining/status INS, jcdk stale-CAP rename).
