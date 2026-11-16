@@ -25,6 +25,16 @@
   <properties>
     <applet.id>01:02:03:04:05:06</applet.id>
     <main.class>helloworld.HelloWorldApplet</main.class>
+
+    <!-- Second applet in the same package and CAP (secure channel demo). -->
+    <applet.id.secure>01:02:03:04:05:07</applet.id.secure>
+    <secure.class>helloworld.SecureChannelApplet</secure.class>
+
+    <!-- The converter wants per-byte 0x notation; keep these in sync with
+      the two AIDs above. They are consumed by src/main/jcdk/jcdk.config. -->
+    <jcdk.aid.hello>0x01:0x02:0x03:0x04:0x05:0x06</jcdk.aid.hello>
+    <jcdk.aid.secure>0x01:0x02:0x03:0x04:0x05:0x07</jcdk.aid.secure>
+    <jcdk.aid.package>0x01:0x02:0x03:0x04:0x05</jcdk.aid.package>
   </properties>
 
   <build>
@@ -32,6 +42,78 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-failsafe-plugin</artifactId>
+        <configuration>
+          <systemPropertyVariables>
+            <javacard.secure.applet.id>${applet.id.secure}</javacard.secure.applet.id>
+            <javacard.secure.applet.id.nocolons>${applet.id.secure.nocolons}</javacard.secure.applet.id.nocolons>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <!-- Derive ${javacard.sdk.norm.path} (trailing slash removed) and the
+          colon-free secure AID; both are used by the jcdk config template and the
+          integration tests. -->
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>build-helper-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>normalize-javacard-sdk-path</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>regex-property</goal>
+            </goals>
+            <configuration>
+              <name>javacard.sdk.norm.path</name>
+              <value>${javacard.sdk.path}</value>
+              <regex>/*$</regex>
+              <replacement></replacement>
+            </configuration>
+          </execution>
+          <execution>
+            <id>sanitize-secure-applet-id</id>
+            <phase>initialize</phase>
+            <goals>
+              <goal>regex-property</goal>
+            </goals>
+            <configuration>
+              <name>applet.id.secure.nocolons</name>
+              <value>${applet.id.secure}</value>
+              <regex>:</regex>
+              <replacement></replacement>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+
+      <plugin>
+        <!-- Materialize the two-applet converter configuration before the jcdk
+          plugin runs. The plugin uses an existing target/generated-jcdk/jcdk.config
+          verbatim instead of generating a single-applet one. -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-resources-plugin</artifactId>
+        <version>3.3.1</version>
+        <executions>
+          <execution>
+            <id>generate-jcdk-config</id>
+            <phase>process-resources</phase>
+            <goals>
+              <goal>copy-resources</goal>
+            </goals>
+            <configuration>
+              <outputDirectory>${project.build.directory}/generated-jcdk</outputDirectory>
+              <resources>
+                <resource>
+                  <directory>src/main/jcdk</directory>
+                  <includes>
+                    <include>jcdk.config</include>
+                  </includes>
+                  <filtering>true</filtering>
+                </resource>
+              </resources>
+            </configuration>
+          </execution>
+        </executions>
       </plugin>
 
       <plugin>
