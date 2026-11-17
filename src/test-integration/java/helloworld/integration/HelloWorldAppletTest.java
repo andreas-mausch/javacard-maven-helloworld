@@ -51,7 +51,7 @@ public class HelloWorldAppletTest {
 
   @Test
   public void testPing() {
-    CommandAPDU apdu = new CommandAPDU(0x80, 0x00, 0, 0);
+    CommandAPDU apdu = new CommandAPDU(0x80, 0x00, 0, 0, 5);
     ResponseAPDU result = simulator.transmitCommand(apdu);
     assertThat(result.getSW()).isEqualTo(0x9000);
     assertThat(result.getData()).isEqualTo("Hello".getBytes());
