@@ -215,6 +215,7 @@ jobs:
 
       - name: Install and test CAP in Oracle simulator
         run: |
+          set -o pipefail
           # The GitHub runner's AppArmor setup denies the 32-bit jcsl
           # simulator's socket() call ("failed to create socket").
           # Lift AppArmor/seccomp for this ephemeral simulator container on
@@ -228,4 +229,6 @@ jobs:
             --volume "$PWD/hello.gpshell:/applet/hello.gpshell:ro" \
             --env GLOBALPLATFORMPRO_VERSION="$GLOBALPLATFORMPRO_VERSION" \
             --env START_JAVACARD_SIMULATOR=y docker-javacard \
-            bash -ec 'gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }; unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK; gp --install ./helloworld.cap; gpshell ./hello.gpshell'
+            bash -ec 'gp() { java -jar "/javacard/gp-v${GLOBALPLATFORMPRO_VERSION}.jar" "$@"; }; unset GP_KEY GP_KEY_ENC GP_KEY_MAC GP_KEY_DEK; gp --install ./helloworld.cap; gpshell ./hello.gpshell' \
+            | tee "$RUNNER_TEMP/oracle-simulator.log"
+          grep -Fxq 'Unwrapped response <-- 48656C6C6F9000' "$RUNNER_TEMP/oracle-simulator.log"
