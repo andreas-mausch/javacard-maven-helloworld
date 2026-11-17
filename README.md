@@ -251,16 +251,20 @@ mvn versions:display-property-updates -DincludeParent
 
 # Continuous integration
 
-`.github/workflows/ci.yml` builds on pushes and pull requests to `main`.
+`.github/workflows/ci.yml` builds on pushes to all branches, published GitHub
+releases, and manual runs. Pull-request builds are disabled for now.
 It runs linting, tests, coverage, size optimization, SBOM generation, license
 checks, vulnerability reports, and signing. It verifies signatures and uploads
 the CAP, JAR, SBOMs, public signing key, and reports. High or critical findings
 in the production CycloneDX SBOM fail CI.
 
 Signing uses an isolated temporary GPG directory. Set
-`OPENPGP_KEY_BIP39_MNEMONIC` to use the existing deterministic CI signing key;
-otherwise CI generates a disposable test key. Test-key signatures are not
-release signatures.
+`OPENPGP_KEY_BIP39_MNEMONIC` for signing published releases; release builds fail
+if it is missing. All runs use `bip39key`. Pushes and manual runs
+use the public test mnemonic
+`beef beef beef beef beef beef beef beef beef beef beef beef` and do not receive
+the signing secret. This fixed test key is publicly reproducible;
+its signatures are not trusted release signatures.
 
 The additional Oracle simulator job is opt-in: start the workflow manually with
 `run_simulator` enabled and set `ORACLE_JAVACARD_SIMULATOR_URL` to the download

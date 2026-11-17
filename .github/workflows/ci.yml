@@ -2,9 +2,8 @@ name: JavaCard Maven CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       run_simulator:
@@ -109,21 +108,25 @@ jobs:
 
       - name: Prepare isolated signing key
         env:
-          OPENPGP_KEY_BIP39_MNEMONIC: ${{ secrets.OPENPGP_KEY_BIP39_MNEMONIC }}
+          OPENPGP_KEY_BIP39_MNEMONIC: ${{ github.event_name == 'release' && secrets.OPENPGP_KEY_BIP39_MNEMONIC || '' }}
+          IS_RELEASE: ${{ github.event_name == 'release' }}
         run: |
           mkdir -p "$GNUPGHOME"
           chmod 700 "$GNUPGHOME"
-          if [ -n "$OPENPGP_KEY_BIP39_MNEMONIC" ]; then
-            curl -fsSL "https://github.com/jpdarago/bip39key/releases/download/v${BIP39KEY_VERSION}/bip39key-x86_64-unknown-linux-musl.tar.gz" -o "$RUNNER_TEMP/bip39key.tar.gz"
-            echo "$BIP39KEY_SHA256  $RUNNER_TEMP/bip39key.tar.gz" | sha256sum --check
-            tar -xzf "$RUNNER_TEMP/bip39key.tar.gz" -C "$RUNNER_TEMP"
-            printf '%s\n' "$OPENPGP_KEY_BIP39_MNEMONIC" | "$RUNNER_TEMP/bip39key-x86_64-unknown-linux-musl" --user-id='JavaCard CI' --armor > "$GNUPGHOME/key.asc"
-            gpg --homedir "$GNUPGHOME" --batch --import "$GNUPGHOME/key.asc"
-          else
-            gpg --homedir "$GNUPGHOME" --batch --pinentry-mode loopback \
-              --passphrase '' --quick-generate-key \
-              'JavaCard CI test key <ci@example.invalid>' rsa2048 sign 0
+          if [ "$IS_RELEASE" = true ] && [ -z "$OPENPGP_KEY_BIP39_MNEMONIC" ]; then
+            echo 'Release signing requires OPENPGP_KEY_BIP39_MNEMONIC' >&2
+            exit 1
           fi
+          user_id='JavaCard CI'
+          if [ "$IS_RELEASE" != true ]; then
+            OPENPGP_KEY_BIP39_MNEMONIC='beef beef beef beef beef beef beef beef beef beef beef beef'
+            user_id='JavaCard CI test key <ci@example.invalid>'
+          fi
+          curl -fsSL "https://github.com/jpdarago/bip39key/releases/download/v${BIP39KEY_VERSION}/bip39key-x86_64-unknown-linux-musl.tar.gz" -o "$RUNNER_TEMP/bip39key.tar.gz"
+          echo "$BIP39KEY_SHA256  $RUNNER_TEMP/bip39key.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/bip39key.tar.gz" -C "$RUNNER_TEMP"
+          printf '%s\n' "$OPENPGP_KEY_BIP39_MNEMONIC" | "$RUNNER_TEMP/bip39key-x86_64-unknown-linux-musl" --user-id="$user_id" --armor > "$GNUPGHOME/key.asc"
+          gpg --homedir "$GNUPGHOME" --batch --import "$GNUPGHOME/key.asc"
           fingerprint=$(gpg --homedir "$GNUPGHOME" --batch --with-colons --list-secret-keys | awk -F: '$1 == "fpr" {print $10; exit}')
           echo "SIGNING_KEY=$fingerprint" >> "$GITHUB_ENV"
 
