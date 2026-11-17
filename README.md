@@ -21,7 +21,7 @@ Only the applet compilation step requires a separate JDK 8 compiler.
 # Configuration
 
 `pom.xml` contains project-specific settings, plugins and dependencies. It inherits
-from `de.neonew.build:javacard-parent:1.4.0`, which extends the Java parent from
+from `de.neonew.build:javacard-parent:1.5.0`, which extends the Java parent from
 [my-maven-setup](https://github.com/andreas-mausch/my-maven-setup).
 
 You **must** define these properties in your `pom.xml`:
@@ -51,7 +51,7 @@ Integration tests receive all values as system properties injected by the parent
 `javacard.applet.id`, `javacard.applet.id.nocolons`, `javacard.package.id` and
 `javacard.package.id.nocolons` — see `HelloWorldAppletTest`.
 
-See [AIDs](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.4.0/README-javacard.md#aids)
+See [AIDs](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.5.0/README-javacard.md#aids)
 for the background on all three.
 
 # Build
@@ -229,8 +229,8 @@ Replace the key ID with the one used for signing.
 
 # More parent features and troubleshooting
 
-See [JavaCard setup](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.4.0/README-javacard.md)
-and [shared features](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.4.0/Features.md)
+See [JavaCard setup](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.5.0/README-javacard.md)
+and [shared features](https://github.com/andreas-mausch/my-maven-setup/blob/javacard-parent-v1.5.0/Features.md)
 for compiler warnings, optional vulnerability scanning with Grype, pre-commit
 hooks, and additional build features.
 
