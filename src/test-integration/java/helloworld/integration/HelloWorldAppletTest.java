@@ -46,7 +46,7 @@ public class HelloWorldAppletTest {
 
     byte[] aid_bytes = Hex.decode(APPLET_AID_HEX);
     AID aid = AIDUtil.create(aid_bytes);
-    simulator.selectApplet(aid);
+    assertThat(simulator.selectApplet(aid)).isTrue();
   }
 
   @Test
