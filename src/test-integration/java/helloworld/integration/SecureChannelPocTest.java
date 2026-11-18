@@ -31,17 +31,26 @@ import org.junit.jupiter.api.Test;
  * behaviour (that is the regression test the review asked for).
  *
  * <p>Threat model for every attack: an on-path NFC relay/eavesdropper. It
- * sees only wire bytes (INIT/EXCHANGE payloads are cleartext on the wire,
- * everything else ciphertext). It holds no session keys.
+ * sees only wire bytes (INIT/EXCHANGE payloads are cleartext, and even
+ * protected messages carry their iv/seq fields in cleartext -- that is the
+ * foundation of POC-B; only the payload is ciphertext). It holds no session
+ * keys.
  *
  * <p>ATTACK PREMISE for POC-B (stated explicitly, this is the design
- * question owners must answer for their own app): the honest app encrypts
- * at least one attacker-INFLUENCED plaintext field through the channel at a
- * known sequence position (e.g. a feedback/search field, like the
- * attacker-injected HTTP body in the TLS 1.0 / BEAST line of attacks). If
- * your app guarantees no such field can ever exist, the POC-B exploit does
- * not apply -- but the IV design outsources that guarantee to every future
- * feature of the app.
+ * question owners must answer for their own app): the honest app encrypts a
+ * plaintext whose FIRST block (offset 0, block-aligned) is attacker-
+ * controlled, at a known sequence position -- e.g. a feedback/search field
+ * placed at the start of the payload, like the attacker-injected HTTP body
+ * in the TLS 1.0 / BEAST line of attacks. If the app's own bytes occupy
+ * offset 0 (length prefix, command tag), the exact block-0 collision does
+ * not fire; alignment can still be brute-forced with a few extra messages
+ * (BEAST's trick) for any secret block index that carries injectable
+ * content. If your app guarantees no such field can ever exist at an
+ * injectable block position, the POC-B exploit does not apply -- but the IV
+ * design outsources that guarantee to every future feature of the app.
+ *
+ * <p>Running: failsafe injects the secure-applet AID; plain-JUnit runs need
+ * -Djavacard.secure.applet.id.nocolons=... or initialization fails.
  */
 public class SecureChannelPocTest {
 
@@ -144,6 +153,22 @@ public class SecureChannelPocTest {
     if (suite == SUITE_GCM) {
       // The replayed command's response used txSeq=1 again: same (key, IV)
       // as the original first response -> identical keystream.
+      //
+      // Severity note: nonce reuse here is worse than the keystream leak
+      // shown by FACT A3. Two (ct, tag) pairs under the SAME nonce give two
+      // tag equations that are linear in the GHASH key H over GF(2^128)
+      // with the SAME mask E_k(J0): an attacker who knows one plaintext
+      // solves for H outright. Forging a NEW command additionally needs the
+      // mask of the forged IV -- a fresh seq has an unknown mask -- but F1
+      // itself hands the attacker exactly that: after an EXCHANGE replay the
+      // card re-accepts OLD seq numbers, i.e. IVs whose masks were already
+      // observed. H-recovery + F1 reset (or the silent increment() wrap at
+      // 2^32 responses) => forged commands with valid tags, AES key never
+      // learned. Integrity total loss: suite-01 + F1 is Critical, not High.
+      //
+      // No CBC analogue of this test on purpose: CBC is not a masked mode,
+      // a repeated IV leaks equal first plaintext blocks at most, and
+      // HMAC has no linear-in-key tag equation that IV reuse can solve.
       byte[] ivOrig = Arrays.copyOfRange(respPing1.getData(), 0, 12);
       byte[] ivRepl = Arrays.copyOfRange(replayedPing2.getData(), 0, 12);
       assertTrue(Arrays.equals(ivOrig, ivRepl),
@@ -156,7 +181,8 @@ public class SecureChannelPocTest {
               + " keystream");
       System.out.println("FACT A3 [GCM]: response IV " + hexStr(ivOrig)
           + " reused; ct1 XOR ct2 == p1 XOR p2 -> SAME KEYSTREAM for two"
-          + " different responses (GCM nonce reuse, catastrophic)");
+          + " different responses; combined with F1's counter reset this"
+          + " chain also yields GHASH-key recovery and forgery (Critical)");
     }
   }
 
@@ -164,8 +190,12 @@ public class SecureChannelPocTest {
    * POC-B (Finding 3): the CBC (suite 02) command IV is
    * nPeer[0..4) || counter || zeros -- fully predictable to anyone who saw
    * the cleartext handshake. With the documented premise (attacker-
-   * influenced plaintext at a known position), the attacker confirms a byte
-   * hypothesis about a PREVIOUS encrypted message with probability 1.
+   * controlled FIRST block of a later message at a known sequence
+   * position), the attacker confirms a whole-block hypothesis about a
+   * PREVIOUS encrypted message with probability 1. The oracle answers
+   * block-granular equality only (all-or-nothing); extracting a secret
+   * block means enumerating candidate blocks, which is realistic for
+   * low-entropy structured payloads and infeasible for random ones.
    */
   @Test
   public void pocB_cbcPredictableIv_confirmsSecretBytes() throws Exception {
@@ -216,7 +246,7 @@ public class SecureChannelPocTest {
     System.out.println("FACT B1: correct hypothesis -> first ciphertext"
         + " blocks equal (prob. 1): " + Arrays.equals(fbCt0, ct0)
         + " => attacker CONFIRMS the secret block '"
-        + new String(h) + "'");
+        + new String(h) + "' (whole-block confirmation, see B2)");
     assertTrue(Arrays.equals(fbCt0, ct0),
         "POC-B: with the correct hypothesis, the first CBC blocks must"
             + " collide deterministically");
@@ -232,7 +262,11 @@ public class SecureChannelPocTest {
     byte[] fbwCt0 = Arrays.copyOfRange(fbw, APDU_DATA_OFF + 16,
         APDU_DATA_OFF + 32);
     System.out.println("FACT B2: hypothesis off by one bit -> blocks equal:"
-        + " " + Arrays.equals(fbwCt0, ct0) + " => per-bit discrimination");
+        + " " + Arrays.equals(fbwCt0, ct0) + " (the oracle is block-level"
+        + " all-or-nothing: even one bit off breaks the collision; secret"
+        + " extraction = enumerate whole-block guesses, feasible for"
+        + " low-entropy structured blocks like this one, hopeless for 16"
+        + " random bytes)");
     assertTrue(!Arrays.equals(fbwCt0, ct0),
         "POC-B: a wrong hypothesis must NOT collide");
 
@@ -244,12 +278,16 @@ public class SecureChannelPocTest {
 
   /**
    * CONTROL for POC-B: same attack shape against a random-IV CBC variant.
-   * The attacker cannot compute P' because V' is unknown; collision
-   * probability is 2^-128 per try. Offline JCE, no card needed.
+   * Randomized CBC is IND-CPA secure until an IV repeats (birthday bound;
+   * Iwata-Oka 2001, the randomized-IV result). This loop is an empirical
+   * illustration of that, not a proof: with independent random IVs every
+   * collision attempt succeeds with probability 2^-128 per try.
    */
   @Test
   public void control_cbcRandomIv_attackFails() throws Exception {
-    SecretKeySpec key = new SecretKeySpec(new byte[32], "AES"); // fixed key
+    // Fixed key is irrelevant to the collision argument: E_K is a
+    // permutation for every K; only IV equality can make blocks collide.
+    SecretKeySpec key = new SecretKeySpec(new byte[32], "AES");
     Cipher enc = Cipher.getInstance("AES/CBC/NoPadding");
     byte[] p = "TOPUP 999999 to ".getBytes();
     int hits = 0;
@@ -260,9 +298,9 @@ public class SecureChannelPocTest {
       rnd.nextBytes(iv);
       enc.init(Cipher.ENCRYPT_MODE, key, new IvParameterSpec(iv));
       byte[] ct0 = enc.doFinal(p);
-      // The attacker's best move with NO knowledge of either IV is to resend
-      // the hypothesised plaintext itself. First blocks collide iff the two
-      // independent random IVs happen to be equal: p = 2^-128 per try.
+      // Without knowledge of either IV, resending the hypothesised
+      // plaintext is just one instance of the general attack shape; blocks
+      // can only collide via IV equality: p = 2^-128 per try.
       byte[] ivNext = new byte[16];
       rnd.nextBytes(ivNext);
       enc.init(Cipher.ENCRYPT_MODE, key, new IvParameterSpec(ivNext));
@@ -281,6 +319,9 @@ public class SecureChannelPocTest {
   // --- tiny helpers ---------------------------------------------------------
 
   private static byte[] nextCounter(byte[] iv) {
+    // Increments the big-endian seq (bytes 4..11) only; wraps silently at
+    // 256 like the card's increment() does at the full width. Fine here:
+    // fixed inputs, seq never leaves [1..3].
     byte[] r = iv.clone();
     r[11] = (byte) (r[11] + 1); // big-endian seq occupies bytes 4..11
     return r;
